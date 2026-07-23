@@ -235,6 +235,21 @@ async def csv_push_to_kafka_activity(record_id: int) -> Dict[str, Any]:
                 schema_errors.append({"row": row_number, "problems": [f"Failed to parse generated payload: {exc}"]})
                 continue
 
+            # Double-check the generated event against the exact same schema
+            # app/kafka/consumer.py enforces at ingestion — catches a row missing
+            # a required field (e.g. no Session ID, now that it's no longer
+            # auto-generated) here, before it's ever published, rather than
+            # relying on the consumer to silently DLQ it later.
+            problems = validate_ingestion_schema(payload_dict, report_type, "create")
+            if problems:
+                schema_errors.append({
+                    "row": row_number,
+                    "submissionId": payload_dict.get("submissionId"),
+                    "sessionId": payload_dict.get("sessionId"),
+                    "problems": problems,
+                })
+                continue
+
             payloads.append((payload_str, f"{record_id}-{len(payloads)}"))
 
     if schema_errors:
