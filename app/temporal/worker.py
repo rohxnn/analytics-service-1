@@ -1,5 +1,7 @@
 import asyncio
+import concurrent.futures
 import logging
+import torch
 from temporalio.client import Client
 from temporalio.worker import Worker
 
@@ -32,6 +34,32 @@ async def start_worker():
     """
     Connects to Temporal server and listens on the configured task queue.
     """
+    # Python's default asyncio thread pool executor is capped at
+    # min(32, cpu_count + 4) — far smaller than our configured worker
+    # concurrency, and every activity's blocking work (LLM calls via urllib,
+    # image download/blur/upload, PDF extraction, embeddings) runs through
+    # asyncio.to_thread(), which uses this default executor unless overridden.
+    # Without sizing it explicitly, WORKER_MAX_CONCURRENT_ACTIVITIES is a
+    # ceiling Temporal never actually reaches — most "concurrent" activities
+    # just queue for a free thread instead of doing real work (load-tested:
+    # this silently capped real throughput to ~12-way parallelism on an
+    # 8-core box, not the 40 configured at the Temporal level).
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(max_workers=settings.WORKER_MAX_CONCURRENT_ACTIVITIES)
+    )
+
+    # PyTorch defaults to using EVERY available CPU core for its own internal
+    # BLAS/linear-algebra threading on each individual call (SentenceTransformer
+    # embeddings here) — fine for a single request at a time, catastrophic once
+    # many activities call into it concurrently. Load-tested: with this unset,
+    # concurrent embedding calls under real load turned a sub-second operation
+    # into 15+ minutes (dozens of activities each trying to claim all 8 cores
+    # for their own inference call, thrashing on context switches instead of
+    # doing work). Capping PyTorch's OWN thread count to 1 makes
+    # WORKER_MAX_CONCURRENT_ACTIVITIES the only source of parallelism, instead
+    # of the two multiplying against each other.
+    torch.set_num_threads(1)
+
     # Initialize database connection pool
     await db.connect()
 
@@ -67,7 +95,8 @@ async def start_worker():
         client,
         task_queue=settings.TEMPORAL_QUEUE,
         workflows=workflows,
-        activities=activities
+        activities=activities,
+        max_concurrent_activities=settings.WORKER_MAX_CONCURRENT_ACTIVITIES,
     )
 
     # Register daily batch schedules if configured for batch mode

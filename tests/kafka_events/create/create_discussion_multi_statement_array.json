@@ -1,0 +1,46 @@
+{
+  "submissionId": 9004,
+  "submissionType": "discussion",
+  "sessionId": "test9004multistatement01",
+  "tenantCode": "mitra",
+  "eventType": "create",
+  "eventPublishedAt": "2026-07-16T10:15:00.000Z",
+  "tags": {
+    "state": "Bihar",
+    "district": "Patna",
+    "organization": "Sahyogi Sanstha",
+    "programId": "8baf962e-7c52-46cd-9787-16e3ee4d4121",
+    "programName": "Shiksha Chaupals",
+    "leaderCategoryId": "96be72cf-aa0a-4bd3-b363-49271254177a",
+    "leaderCategoryName": "Women leader (WL)"
+  },
+  "data": {
+    "title": "Array iteration regression test — 3 independent single-theme challenges (expected: 3 separate Standard rows, each single-themed, no delimiter splitting)",
+    "userId": "9004",
+    "userName": "Test User",
+    "designation": "Women leader",
+    "submissionDate": "2026-07-16T10:15:00Z",
+    "imageUrls": [],
+    "pdfUrls": {
+      "original": "https://mohini-static.shikshalokam.org/chatbot/storymedia/9004/original.pdf",
+      "masked": "https://mohini-static.shikshalokam.org/chatbot/storymedia/masked/9004/original.pdf"
+    },
+    "transcriptLink": "test9004transcriptlink0001",
+    "challenges": [
+      "Our school children are not given books on time.",
+      "There is a shortage of teachers in the school, due to which subject-wise studies are not done.",
+      "The school is very far from the village."
+    ],
+    "solutions": [
+      "Ensuring books are distributed to students at the start of the academic year.",
+      "Recruiting additional subject teachers to cover the shortage.",
+      "Arranging safe transportation for students from distant villages."
+    ],
+    "participantsData": [
+      { "role": "men", "count": 3 },
+      { "role": "women", "count": 5 }
+    ],
+    "author": "9004",
+    "language": "en"
+  }
+}

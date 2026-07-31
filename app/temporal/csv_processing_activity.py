@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -18,16 +19,25 @@ from app.services.ingestion_validation import validate_ingestion_schema
 logger = logging.getLogger("analytics_service.temporal.csv_processing_activity")
 
 _producer: Optional[Producer] = None
+# Real OS-thread lock, not asyncio.Lock — _get_producer() is called from
+# separate threads via asyncio.to_thread (_push_rows_sync), not concurrently
+# within one event loop. Without this, concurrent CsvProcessingWorkflow child
+# workflows could each construct their own Producer at once (see the identical
+# fix + reasoning in app/services/classifier.py's _get_model()).
+_producer_lock = threading.Lock()
 
 
 def _get_producer() -> Producer:
     global _producer
-    if _producer is None:
-        _producer = Producer({
-            "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
-            "acks": "all",
-            "enable.idempotence": True,
-        })
+    if _producer is not None:
+        return _producer
+    with _producer_lock:
+        if _producer is None:
+            _producer = Producer({
+                "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
+                "acks": "all",
+                "enable.idempotence": True,
+            })
     return _producer
 
 

@@ -8,6 +8,7 @@ fastapi>=0.112.0
 python-multipart>=0.0.9
 uvicorn>=0.30.0
 pytest>=8.0.0
+httpx>=0.24.0
 json5>=0.14.0
 streamlit>=1.35.0
 pandas>=2.0.0

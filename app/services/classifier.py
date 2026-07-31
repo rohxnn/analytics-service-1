@@ -5,6 +5,7 @@ Uses SentenceTransformer (all-MiniLM-L6-v2 by default) to encode statements
 and approved themes, then computes cosine similarity to find the best match.
 """
 import logging
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
@@ -17,16 +18,32 @@ logger = logging.getLogger("analytics_service.services.classifier")
 
 # Module-level model cache — loaded once per worker process
 _model: Optional[SentenceTransformer] = None
+# Real OS-thread lock, not asyncio.Lock — this is called from separate threads
+# via asyncio.to_thread (build_theme_embeddings/get_theme_similarities), not
+# concurrently within one event loop.
+_model_lock = threading.Lock()
 
 
 def _get_model() -> SentenceTransformer:
-    """Lazily load the sentence transformer model (cached at module level)."""
+    """
+    Lazily load the sentence transformer model (cached at module level).
+    Thread-safe: double-checked locking, since multiple concurrent activities
+    call this from separate OS threads. Without the lock, several threads can
+    all see _model is None at once and each construct their own
+    SentenceTransformer concurrently — that's not safe (load-tested: it
+    corrupts PyTorch's internal state with "NotImplementedError: Cannot copy
+    out of meta tensor; no data" under concurrent load). The un-locked fast
+    path below keeps the common case (already loaded) lock-free.
+    """
     global _model
-    if _model is None:
-        model_name = settings.EMBEDDING_MODEL_NAME
-        logger.info(f"Loading SentenceTransformer model '{model_name}'...")
-        _model = SentenceTransformer(model_name)
-        logger.info(f"SentenceTransformer model '{model_name}' loaded successfully.")
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            model_name = settings.EMBEDDING_MODEL_NAME
+            logger.info(f"Loading SentenceTransformer model '{model_name}'...")
+            _model = SentenceTransformer(model_name)
+            logger.info(f"SentenceTransformer model '{model_name}' loaded successfully.")
     return _model
 
 

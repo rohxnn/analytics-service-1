@@ -271,8 +271,13 @@ async def pii_and_abusive_language_detection_activity(params: Dict[str, Any]) ->
                 meta_data=usage_meta or None,
             )
 
-            # Step 6. Update the status in submissions to success
-            await update_submission_status(conn, submission_id, tenant_code, "success")
+            # Deliberately not marking the submission's overall status "success"
+            # here — this is only the first of several pipeline steps (thematic
+            # classification, image blur, and for stories, story rating still
+            # follow). Only the workflow's own final update_status_activity call,
+            # once every step has actually completed, is allowed to set the
+            # submission's terminal status — otherwise the row reports "success"
+            # while most of the pipeline hasn't run yet.
 
         return {
             "status": "success",
@@ -310,8 +315,10 @@ async def pii_and_abusive_language_detection_activity(params: Dict[str, Any]) ->
                     meta_data=usage_meta
                 )
 
-                # Update the status in submissions to failed
-                await update_submission_status(conn, submission_id, tenant_code, "failed")
+            # Not marking the submission "failed" here either — the workflow's
+            # own exception handler (workflows.py) already does this with the
+            # full per-step process_status once this exception propagates up,
+            # via the same raise below.
         except Exception as log_err:
             logger.error(f"Failed to log error to llm_logs: {log_err}")
 
