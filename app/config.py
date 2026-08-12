@@ -40,6 +40,15 @@ class Settings(BaseSettings):
 
     # Temporal Configuration
     TEMPORAL_HOST: str = Field(default="localhost:7233")
+    # Lets multiple environments (dev/qa) share one Temporal cluster safely.
+    # Namespaces are Temporal's own multi-tenancy primitive — task queues and
+    # workflow history are scoped per-namespace, so two environments in
+    # different namespaces never see each other's work. Without this, every
+    # Client.connect() call implicitly uses the "default" namespace, and if
+    # dev and qa also share TEMPORAL_QUEUE, their workers compete for and can
+    # execute each other's tasks — each looking up the resulting submission_id
+    # in its OWN database, which fails (or worse, hits the wrong row).
+    TEMPORAL_NAMESPACE: str = Field(default="default")
     TEMPORAL_QUEUE: str = Field(default="analytics-processing-queue")
     # Caps how many activities the worker runs simultaneously, regardless of how
     # many workflows are started/queued — this is what actually protects the DB

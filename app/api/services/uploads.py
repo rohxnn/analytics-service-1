@@ -438,7 +438,7 @@ async def handle_upload(
     # Trigger Temporal workflow in real-time mode
     if settings.PROCESSING_MODE.lower().strip() == "real-time":
         try:
-            temporal_client = await Client.connect(settings.TEMPORAL_HOST)
+            temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
             await temporal_client.start_workflow(
                 CsvProcessingWorkflow.run,
                 record_id,
@@ -478,7 +478,7 @@ async def handle_push(record_id: int) -> dict:
         raise RecordAlreadyProcessing("Record is already being processed")
 
     try:
-        temporal_client = await Client.connect(settings.TEMPORAL_HOST)
+        temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
         await temporal_client.start_workflow(
             CsvProcessingWorkflow.run,
             record_id,

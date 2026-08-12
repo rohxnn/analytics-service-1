@@ -65,7 +65,7 @@ async def start_worker():
 
     try:
         logger.info(f"Connecting to Temporal Server at {settings.TEMPORAL_HOST}...")
-        client = await Client.connect(settings.TEMPORAL_HOST)
+        client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
     except Exception as e:
         logger.error(f"Failed to connect to Temporal Server on {settings.TEMPORAL_HOST}: {e}")
         await db.disconnect()

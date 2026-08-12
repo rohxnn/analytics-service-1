@@ -68,7 +68,7 @@ class IngestionConsumer:
         self.dlq_producer = Producer({"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS})
         try:
             logger.info(f"Initializing Temporal client on {settings.TEMPORAL_HOST}...")
-            self.temporal_client = await Client.connect(settings.TEMPORAL_HOST)
+            self.temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
         except Exception as e:
             logger.error(f"Failed to connect to Temporal: {e}. Worker will not be able to trigger real-time flows.")
 
@@ -79,7 +79,7 @@ class IngestionConsumer:
         if not self.temporal_client:
             try:
                 logger.info(f"Temporal client not connected. Attempting to reconnect to {settings.TEMPORAL_HOST}...")
-                self.temporal_client = await Client.connect(settings.TEMPORAL_HOST)
+                self.temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
             except Exception as e:
                 logger.error(f"Failed to connect to Temporal: {e}. Leaving submission {submission_id} as 'pending'.")
                 return
