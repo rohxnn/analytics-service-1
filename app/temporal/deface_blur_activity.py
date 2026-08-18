@@ -135,12 +135,18 @@ async def _process_one_image(submission_id: str, tenant_code: str, sub_type: str
 
         # 2. Deface/Blur image — gated globally (see BLUR_CONCURRENCY_LIMIT setting),
         # unlike the download/upload legs, since this is the memory-heavy step.
+        # DEFACE_SCALE downscales the detection input (blur is still applied to the
+        # full-res image) — this is what actually cuts per-call CPU/memory cost;
+        # the semaphore above only limits how many of these run at once, not how
+        # expensive each individual call is.
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+        deface_scale = getattr(settings, "DEFACE_SCALE", None) or "640x360"
         async with _get_blur_semaphore():
             await _run_in_image_executor(
                 anonymize_face,
                 input_path=str(local_path),
                 output_path=str(output_path),
+                scale=deface_scale,
             )
 
         # 3. Upload to GCP Storage
