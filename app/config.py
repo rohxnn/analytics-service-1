@@ -150,6 +150,10 @@ class Settings(BaseSettings):
     STORY_BLOB: str = Field(default="")
     DISCUSSION_BLOB: str = Field(default="")
     MEDIA_BASE_URL: str = Field(default="")
+    # Image Blur CPU Throttling
+    # Downscale resolution for face-detection neural network (WxH).
+    # Only affects detection speed — blur is applied to the original full-res image.
+    DEFACE_SCALE: str = Field(default="640x360")
 
     model_config = SettingsConfigDict(
         env_file=".env",
