@@ -225,10 +225,14 @@ async def insert_or_update_submission(
         # Upsert parent metadata tables (reads from flattened tags)
         program_id, leader_id = await upsert_metadata(conn, tags, tenant_code)
 
-        # Parse submission date. On a partial update where submissionDate is absent,
-        # leave it None (rather than defaulting to now()) so COALESCE below preserves
-        # the existing value instead of overwriting it with a "real" default.
-        sub_date_str = data.get("submissionDate")
+        # Parse submission date (report created at).
+        # For discussion submissions, report created at comes from eventPublishedAt.
+        normalized_sub_type = submission_type.lower().strip()
+        if "discussion" in normalized_sub_type:
+            sub_date_str = event_payload.get("eventPublishedAt")
+        else:
+            sub_date_str = data.get("submissionDate")
+
         if sub_date_str:
             submission_date = datetime.fromisoformat(sub_date_str.replace("Z", "+00:00"))
         elif event_type != "update":
@@ -374,6 +378,13 @@ async def insert_or_update_submission(
             image_urls = _normalize_media_url_list(data.get("imageUrls"))
             pdf_urls, masked_pdf_urls = _normalize_pdf_urls(data.get("pdfUrls"))
 
+            # Parse discussion date (date the discussion took place) from submissionDate.
+            disc_date_str = data.get("submissionDate")
+            discussion_date = (
+                datetime.fromisoformat(disc_date_str.replace("Z", "+00:00"))
+                if disc_date_str else None
+            )
+
             if row_exists:
                 await conn.execute(
                     """
@@ -387,6 +398,7 @@ async def insert_or_update_submission(
                         pdf_urls = COALESCE($9, pdf_urls),
                         masked_pdf_urls = COALESCE($10, masked_pdf_urls),
                         transcript_link = COALESCE($11, transcript_link),
+                        discussion_date = COALESCE($12, discussion_date),
                         updated_at = now()
                     WHERE submission_id = $1 AND tenant_code = $2
                     """,
@@ -399,16 +411,17 @@ async def insert_or_update_submission(
                     image_urls,
                     pdf_urls,
                     masked_pdf_urls,
-                    data.get("transcriptLink")
+                    data.get("transcriptLink"),
+                    discussion_date
                 )
             else:
                 await conn.execute(
                     """
                     INSERT INTO discussion_submissions (
                         submission_id, tenant_code, title, challenges, solutions,
-                        author, language, image_urls, pdf_urls, masked_pdf_urls, transcript_link
+                        author, language, image_urls, pdf_urls, masked_pdf_urls, transcript_link, discussion_date
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                     """,
                     submission_id, tenant_code,
                     data.get("title"),
@@ -419,7 +432,8 @@ async def insert_or_update_submission(
                     image_urls,
                     pdf_urls,
                     masked_pdf_urls,
-                    data.get("transcriptLink")
+                    data.get("transcriptLink"),
+                    discussion_date
                 )
 
             # Dynamic KPI metrics: participantsData is a full snapshot when present;

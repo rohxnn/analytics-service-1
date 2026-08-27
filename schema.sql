@@ -100,6 +100,7 @@ CREATE TABLE discussion_submissions (
     submission_id       TEXT NOT NULL,
     tenant_code         TEXT NOT NULL,
     title               TEXT,
+    discussion_date     TIMESTAMPTZ,
     challenges          TEXT[], -- one array element per discrete statement (see operations.py's _normalize_statement_list)
     solutions           TEXT[], -- same format as challenges
     author              TEXT,
