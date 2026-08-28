@@ -10,8 +10,6 @@ from app.database.db import db
 from app.temporal.workflows import (
     ConfigDrivenProcessingWorkflow,
     BatchProcessingWorkflow,
-    CsvProcessingWorkflow,
-    CsvBatchProcessingWorkflow,
 )
 from app.temporal.activities import (
     update_status_activity,
@@ -21,12 +19,6 @@ from app.temporal.deface_blur_activity import deface_blur_activity
 from app.temporal.pii_and_abusive_activity import pii_and_abusive_language_detection_activity
 from app.temporal.thematic_activity import thematic_classification_activity
 from app.temporal.story_rating_activity import story_rating_activity
-from app.temporal.csv_processing_activity import (
-    csv_fetch_and_validate_activity,
-    csv_push_to_kafka_activity,
-    csv_update_status_activity,
-    fetch_pending_csv_uploads_activity,
-)
 
 logger = logging.getLogger("analytics_service.temporal.worker")
 
@@ -75,8 +67,6 @@ async def start_worker():
     workflows = [
         ConfigDrivenProcessingWorkflow,
         BatchProcessingWorkflow,
-        CsvProcessingWorkflow,
-        CsvBatchProcessingWorkflow,
     ]
     activities = [
         pii_and_abusive_language_detection_activity,
@@ -85,10 +75,6 @@ async def start_worker():
         story_rating_activity,
         update_status_activity,
         fetch_pending_submissions_activity,
-        csv_fetch_and_validate_activity,
-        csv_push_to_kafka_activity,
-        csv_update_status_activity,
-        fetch_pending_csv_uploads_activity,
     ]
 
     worker = Worker(
@@ -108,29 +94,7 @@ async def start_worker():
             ScheduleAlreadyRunningError,
         )
 
-        # 1. Register CSV batch processing schedule
-        try:
-            logger.info(f"Registering CSV batch schedule '{settings.CSV_SCHEDULE_CRON_TIME}' in Temporal...")
-            await client.create_schedule(
-                id="csv-batch-processing",
-                schedule=Schedule(
-                    action=ScheduleActionStartWorkflow(
-                        CsvBatchProcessingWorkflow.run,
-                        id="csv-batch-processing-run",
-                        task_queue=settings.TEMPORAL_QUEUE,
-                    ),
-                    spec=ScheduleSpec(
-                        cron_expressions=[settings.CSV_SCHEDULE_CRON_TIME]
-                    ),
-                ),
-            )
-            logger.info("CSV batch schedule successfully registered.")
-        except ScheduleAlreadyRunningError:
-            logger.info("CSV batch schedule already exists in Temporal. Skipping registration.")
-        except Exception as e:
-            logger.error(f"Failed to register CSV batch schedule in Temporal: {e}")
-
-        # 2. Register daily analysis batch processing schedule
+        # Register daily analysis batch processing schedule
         try:
             logger.info(f"Registering daily analysis batch schedule '{settings.BATCH_SCHEDULE_CRON}' in Temporal...")
             await client.create_schedule(
@@ -156,7 +120,7 @@ async def start_worker():
         # Real-time mode: clean up any leftover batch schedules from Temporal Server
         # (prevents a schedule left behind from a prior batch-mode config from
         # silently retrying forever with outdated arguments).
-        for sched_id in ("csv-batch-processing", "daily-batch-processing"):
+        for sched_id in ("daily-batch-processing",):
             try:
                 handle = client.get_schedule_handle(sched_id)
                 await handle.delete()

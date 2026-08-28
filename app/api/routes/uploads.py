@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, Form, UploadFile, File
+from fastapi import APIRouter, Depends, Form, UploadFile, File, BackgroundTasks
 from fastapi.security import HTTPAuthorizationCredentials
 
 from app.api.deps import verify_auth_token
@@ -19,6 +19,7 @@ uploads_router = APIRouter(prefix="/v1", tags=["CSV Pipeline"])
 
 @uploads_router.post("/upload/", response_model=UploadResponse)
 async def upload_report(
+    background_tasks: BackgroundTasks,
     report_type: str = Form(...),
     program_name: str = Form(...),
     leader_category: str = Form(...),
@@ -30,7 +31,8 @@ async def upload_report(
     Upload a CSV report file.
 
     The file is stored in GCS and a tracking record is created with
-    status='pending' (validation passed) or status='on_hold' (validation failed).
+    status='pending'. Processing (column validation, Kafka publishing)
+    runs in the background.
     """
     # Pure request-shape checks
     report_type = validate_report_type(report_type)
@@ -47,15 +49,18 @@ async def upload_report(
         tenant_code=tenant_code,
         file_name=file.filename,
         file_bytes=file_bytes,
+        background_tasks=background_tasks,
     )
 
 
 @uploads_router.post("/process/csv/{record_id}")
 async def push_record(
     record_id: int,
+    background_tasks: BackgroundTasks,
     _token: HTTPAuthorizationCredentials = Depends(verify_auth_token),
 ):
     """
     Manually trigger processing for a specific csv_upload record in pending status.
     """
-    return await upload_service.handle_push(record_id)
+    return await upload_service.handle_push(record_id, background_tasks)
+

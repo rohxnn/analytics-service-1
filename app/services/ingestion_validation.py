@@ -34,7 +34,7 @@ def validate_ingestion_schema(event: dict, submission_type: str, event_type: str
     an empty list means the event is valid.
 
     Shared between app/kafka/consumer.py (validates events arriving off the Kafka
-    topic) and app/temporal/csv_processing_activity.py (validates each CSV-derived
+    topic) and app/api/services/uploads.py (validates each CSV-derived
     event against the same schema before it's ever published to Kafka).
     """
     normalized_type = submission_type.lower().strip() if isinstance(submission_type, str) else ""

@@ -3,14 +3,19 @@ import asyncio
 import io
 import json
 import logging
+import threading
+import uuid
 from datetime import datetime
 import pandas as pd
-from temporalio.client import Client
+from confluent_kafka import Producer, KafkaException
+from fastapi import BackgroundTasks
 
 from app.config import settings
 from app.api.validators.uploads import validate_columns
-from app.services.gcp_storage import upload_csv
+from app.services.gcp_storage import upload_csv, fetch_csv
 from app.database import operations
+from app.database.db import db
+from app.services.ingestion_validation import validate_ingestion_schema
 from app.api.exceptions import (
     DuplicateFile,
     InvalidCsvColumns,
@@ -366,6 +371,257 @@ def rows_to_json(
 
 
 # ---------------------------------------------------------------------------
+# Kafka Producer (singleton, thread-safe)
+# ---------------------------------------------------------------------------
+
+_producer: Optional[Producer] = None
+_producer_lock = threading.Lock()
+
+
+def _get_producer() -> Producer:
+    """Return a singleton confluent-kafka Producer, creating it on first call."""
+    global _producer
+    if _producer is not None:
+        return _producer
+    with _producer_lock:
+        if _producer is None:
+            _producer = Producer({
+                "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
+                "acks": "all",
+                "enable.idempotence": True,
+            })
+    return _producer
+
+
+def _push_rows_sync(payloads: List[Any]) -> None:
+    """
+    Runs in a worker thread (via asyncio.to_thread) — produce()/flush() are
+    blocking calls. Flushes once for the whole batch rather than per row.
+    """
+    producer = _get_producer()
+    delivery_error = {}
+
+    def _on_delivery(err, _msg):
+        if err is not None:
+            delivery_error["error"] = err
+
+    for payload, key in payloads:
+        producer.produce(
+            settings.KAFKA_TOPIC_INGESTION,
+            value=payload.encode("utf-8"),
+            key=key.encode("utf-8") if key else None,
+            callback=_on_delivery,
+        )
+        producer.poll(0)
+        if "error" in delivery_error:
+            raise KafkaException(delivery_error["error"])
+
+    remaining = producer.flush(10)
+    if remaining > 0:
+        raise TimeoutError(f"Timed out waiting for Kafka delivery ({remaining} still in-flight)")
+    if "error" in delivery_error:
+        raise KafkaException(delivery_error["error"])
+
+
+# ---------------------------------------------------------------------------
+# Inline CSV Processing (replaces Temporal activities)
+# ---------------------------------------------------------------------------
+
+async def process_csv_inline(record_id: int, file_bytes: Optional[bytes] = None) -> None:
+    """
+    Processes a single csv_upload record end-to-end:
+      1. Use in-memory CSV bytes (or fetch from cloud storage if file_bytes is None)
+      2. Validate columns
+      3. Look up program/leader metadata from DB
+      4. Build Kafka payloads, schema-validate each row
+      5. Publish valid rows to Kafka
+      6. Update DB status to 'success' (or 'on_hold' on failure)
+
+    Runs as a FastAPI BackgroundTask — any exception is caught, logged, and
+    recorded in the csv_uploads row so the caller's 200 response is unaffected.
+    """
+    record = await operations.get_record(record_id)
+    if not record:
+        logger.error("process_csv_inline: record %s not found", record_id)
+        return
+
+    cloud_storage_path = record["cloud_storage_path"]
+    report_type = record["report_type"]
+
+    # --- 1. Fetch/Parse CSV (use in-memory file_bytes if available, else fetch from storage) ---
+    try:
+        if file_bytes is None:
+            csv_file = await asyncio.to_thread(fetch_csv, cloud_storage_path)
+        else:
+            csv_file = file_bytes
+        df = await asyncio.to_thread(load_csv, csv_file)
+    except Exception as exc:
+        logger.exception("Failed to fetch/load CSV for record %s", record_id)
+        error_meta = {
+            "stage": "CSV Fetching",
+            "error": "Failed to fetch/load CSV",
+            "exception": str(exc),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        await operations.update_status(record_id, "on_hold", error_meta)
+        return
+
+    # --- 2. Validate columns ---
+    is_valid, errors = await asyncio.to_thread(validate_columns, df, report_type)
+    if not is_valid:
+        logger.warning("Validation failed for record %s: %s", record_id, errors)
+        error_meta = {
+            "stage": "CSV Column Validation",
+            "error": "Invalid CSV schema",
+            "validation_errors": errors,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+        await operations.update_status(record_id, "on_hold", error_meta)
+        return
+
+    await operations.update_status(record_id, "in_progress")
+
+    # --- 3. Look up program / leader category metadata from Postgres ---
+    program_info = None
+    leader_info = None
+    record_meta = record.get("meta_data") or {}
+    if isinstance(record_meta, str):
+        try:
+            record_meta = json.loads(record_meta)
+        except json.JSONDecodeError:
+            record_meta = {}
+    if not isinstance(record_meta, dict):
+        record_meta = {}
+
+    tenant_code = record_meta.get("tenant_code") or "mitra"
+
+    try:
+        async with db.pool.acquire() as conn:
+            leader_row = await conn.fetchrow(
+                "SELECT id, name, description, tenant_code FROM leader_category WHERE name = $1 LIMIT 1",
+                record.get("leader_category"),
+            )
+            if leader_row:
+                leader_info = {
+                    "id": str(leader_row["id"]),
+                    "name": leader_row["name"],
+                    "description": leader_row["description"],
+                }
+                tenant_code = leader_row["tenant_code"]
+
+            if leader_row:
+                program_row = await conn.fetchrow(
+                    "SELECT id, name, description, tenant_code, leaders_id FROM programs WHERE name = $1 AND leaders_id = $2 LIMIT 1",
+                    record.get("program_name"),
+                    leader_row["id"],
+                )
+            else:
+                program_row = await conn.fetchrow(
+                    "SELECT id, name, description, tenant_code, leaders_id FROM programs WHERE name = $1 LIMIT 1",
+                    record.get("program_name"),
+                )
+
+            if program_row:
+                program_info = {
+                    "id": str(program_row["id"]),
+                    "name": program_row["name"],
+                    "description": program_row["description"],
+                }
+                tenant_code = program_row.get("tenant_code", tenant_code)
+
+            if program_row and not leader_info:
+                leader_row_from_program = await conn.fetchrow(
+                    "SELECT id, name, description, tenant_code FROM leader_category WHERE id = $1 LIMIT 1",
+                    program_row["leaders_id"],
+                )
+                if leader_row_from_program:
+                    leader_info = {
+                        "id": str(leader_row_from_program["id"]),
+                        "name": leader_row_from_program["name"],
+                        "description": leader_row_from_program["description"],
+                    }
+                    tenant_code = leader_row_from_program.get("tenant_code", tenant_code)
+    except Exception as db_exc:
+        logger.warning("Failed to query program/leader category metadata from DB: %s", db_exc)
+
+    # Fallbacks if DB query returned nothing
+    if not leader_info:
+        leader_info = {
+            "id": str(uuid.uuid4()),
+            "name": record.get("leader_category") or "District Leader",
+            "description": f"Leader category: {record.get('leader_category') or 'District Leader'}",
+        }
+    if not program_info:
+        program_info = {
+            "id": str(uuid.uuid4()),
+            "name": record.get("program_name") or "My Program",
+            "description": f"Program: {record.get('program_name') or 'My Program'}",
+        }
+
+    metadata = {
+        "programInfo": program_info,
+        "LeaderCategoryInfo": leader_info,
+        "tenantCode": tenant_code,
+    }
+
+    # --- 4. Build Kafka payloads and schema-validate each row ---
+    chunks = split_csv(df)
+    payloads = []
+    schema_errors = []
+    row_number = 0
+
+    for chunk in chunks:
+        for payload_str in rows_to_json(chunk, report_type, metadata=metadata):
+            row_number += 1
+            try:
+                payload_dict = json.loads(payload_str)
+            except json.JSONDecodeError as exc:
+                schema_errors.append({"row": row_number, "problems": [f"Failed to parse generated payload: {exc}"]})
+                continue
+
+            problems = validate_ingestion_schema(payload_dict, report_type, "create")
+            if problems:
+                schema_errors.append({
+                    "row": row_number,
+                    "submissionId": payload_dict.get("submissionId"),
+                    "sessionId": payload_dict.get("sessionId"),
+                    "problems": problems,
+                })
+                continue
+
+            payloads.append((payload_str, f"{record_id}-{len(payloads)}"))
+
+    if schema_errors:
+        logger.warning(
+            "record %s: %d of %d row(s) failed pre-publish schema validation and were skipped: %s",
+            record_id, len(schema_errors), row_number, schema_errors,
+        )
+
+    # --- 5. Publish to Kafka ---
+    if payloads:
+        try:
+            await asyncio.to_thread(_push_rows_sync, payloads)
+        except Exception as exc:
+            logger.exception("Kafka push failed for record %s", record_id)
+            error_meta = {
+                "stage": "Kafka Publishing",
+                "error": "Failed to publish record",
+                "exception": str(exc),
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+            }
+            await operations.update_status(record_id, "on_hold", error_meta)
+            return
+
+    # --- 6. Update status to success ---
+    final_meta = {"rows_pushed": len(payloads), "processed_at": datetime.utcnow().isoformat() + "Z"}
+    if schema_errors:
+        final_meta["schema_validation_errors"] = schema_errors
+
+    await operations.update_status(record_id, "success", final_meta)
+    logger.info("CSV record %s processed successfully: %d rows pushed to Kafka", record_id, len(payloads))
+
+
+# ---------------------------------------------------------------------------
 # Service Orchestration Logic
 # ---------------------------------------------------------------------------
 
@@ -376,9 +632,8 @@ async def handle_upload(
     tenant_code: str,
     file_name: str,
     file_bytes: bytes,
+    background_tasks: BackgroundTasks,
 ) -> dict:
-    from app.temporal.workflows import CsvProcessingWorkflow
-
     normalized_type = report_type.lower().strip()
     file_size = len(file_bytes)
 
@@ -435,21 +690,9 @@ async def handle_upload(
         record_id, normalized_type, cloud_storage_path,
     )
 
-    # Trigger Temporal workflow in real-time mode
-    if settings.PROCESSING_MODE.lower().strip() == "real-time":
-        try:
-            temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
-            await temporal_client.start_workflow(
-                CsvProcessingWorkflow.run,
-                record_id,
-                id=f"csv-upload-{record_id}",
-                task_queue=settings.TEMPORAL_QUEUE,
-            )
-            logger.info("Triggered real-time CsvProcessingWorkflow for upload ID %s", record_id)
-        except Exception as e:
-            logger.error("Failed to trigger real-time CsvProcessingWorkflow: %s", e)
-            await operations.update_status(record_id, "on_hold", {"error": f"Temporal trigger failed: {e}"})
-            raise RuntimeError(f"Failed to start CSV processing workflow: {e}")
+    # Schedule inline processing as a background task (pass file_bytes to avoid extra GCS download)
+    background_tasks.add_task(process_csv_inline, record_id, file_bytes)
+    logger.info("Scheduled inline CSV processing for upload ID %s", record_id)
 
     return {
         "message": "Successfully uploaded to cloud",
@@ -458,9 +701,7 @@ async def handle_upload(
     }
 
 
-async def handle_push(record_id: int) -> dict:
-    from app.temporal.workflows import CsvProcessingWorkflow
-
+async def handle_push(record_id: int, background_tasks: BackgroundTasks) -> dict:
     record = await operations.get_record(record_id)
     if not record:
         raise RecordNotFound("Record not found")
@@ -477,15 +718,7 @@ async def handle_push(record_id: int) -> dict:
     if claim_status == "in_progress":
         raise RecordAlreadyProcessing("Record is already being processed")
 
-    try:
-        temporal_client = await Client.connect(settings.TEMPORAL_HOST, namespace=settings.TEMPORAL_NAMESPACE)
-        await temporal_client.start_workflow(
-            CsvProcessingWorkflow.run,
-            record_id,
-            id=f"csv-upload-{record_id}",
-            task_queue=settings.TEMPORAL_QUEUE,
-        )
-        return {"status": "success", "message": "CSV processing workflow started"}
-    except Exception as e:
-        await operations.update_status(record_id, "on_hold", {"error": str(e)})
-        raise RuntimeError(f"Failed to start CSV processing workflow: {e}")
+    # Schedule inline processing as a background task (no Temporal)
+    background_tasks.add_task(process_csv_inline, record_id)
+    return {"status": "success", "message": "CSV processing started"}
+

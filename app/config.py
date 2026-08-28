@@ -77,7 +77,6 @@ class Settings(BaseSettings):
     # CSV Upload / Processing Configuration
     MAX_CSV_UPLOAD_BYTES: int = Field(default=10485760)  # 10MB
     CSV_BLOB_UPLOADS: str = Field(default="mitra_dashboard_api_output")
-    CSV_SCHEDULE_CRON_TIME: str = Field(default="40 15 * * *")
     # Expected CSV column headers per report type (JSON arrays of column names,
     # matched case-insensitively against the uploaded file's header row).
     STORY_CSV_COLUMN: str = Field(
