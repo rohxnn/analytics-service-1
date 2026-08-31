@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import urllib.parse
 from typing import Dict, Any, Optional, List
 import asyncpg
@@ -69,6 +70,68 @@ def _normalize_pdf_urls(value: Any) -> tuple:
         return original, masked
     # Legacy fallback: plain string or list
     return _normalize_media_url_list(value), None
+
+def clean_statement(text: str) -> str:
+    """
+    Cleans a raw statement by removing commas, question marks, and bracket
+    characters, then collapsing any resulting extra whitespace.
+    """
+    text = re.sub(r"[,?\(\)\[\]\{\}]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+async def insert_statement_with_parent_check(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+    submission_type: str,
+    statement_type: str,
+    raw_text: str,
+) -> None:
+    """
+    Cleans raw_text, inserts it into the statements table, then checks whether
+    an identical statement (case-insensitive) already exists. If one is found
+    the newly inserted row's parent_id is set to that existing statement's UUID id.
+    """
+    cleaned = clean_statement(raw_text)
+    if not cleaned:
+        return
+
+    # Insert the new statement and get its id back
+    new_id = await conn.fetchval(
+        """
+        INSERT INTO statements
+            (submission_id, tenant_code, submission_type, statement_type, raw_statement)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id
+        """,
+        str(submission_id), tenant_code, submission_type, statement_type, cleaned
+    )
+
+    # Look for an existing statement with exactly the same text (case-insensitive)
+    matched_id = await conn.fetchval(
+        """
+        SELECT id
+        FROM statements
+        WHERE LOWER(raw_statement) = LOWER($1)
+          AND id != $2
+        LIMIT 1
+        """,
+        cleaned, new_id
+    )
+
+    if matched_id:
+        await conn.execute(
+            "UPDATE statements SET parent_id = $1, updated_at = now() WHERE id = $2",
+            matched_id, new_id
+        )
+        logger.info(
+            f"Statement [{new_id}] matched existing statement [{matched_id}] — parent_id assigned."
+        )
+    else:
+        logger.info(f"Statement [{new_id}] stored with no duplicate found.")
+
 
 async def upsert_metadata(conn: asyncpg.Connection, tags: Dict[str, Any], tenant_code: str) -> tuple:
     """
@@ -363,6 +426,21 @@ async def insert_or_update_submission(
                     data.get("transcriptLink")
                 )
 
+            # Extract challenges for story submission into statements table
+            raw_story_challenges = data.get("challenges") or data.get("challenge")
+            if raw_story_challenges:
+                challenges_list = raw_story_challenges if isinstance(raw_story_challenges, list) else [raw_story_challenges]
+                for raw_challenge in challenges_list:
+                    if raw_challenge:
+                        await insert_statement_with_parent_check(
+                            conn,
+                            submission_id,
+                            tenant_code,
+                            submission_type="story",
+                            statement_type="challenge",
+                            raw_text=str(raw_challenge),
+                        )
+
         elif "discussion" in normalized_type:
             # Upsert discussion submission
             row_exists = await conn.fetchval(
@@ -430,6 +508,33 @@ async def insert_or_update_submission(
                 await upsert_participant_metrics(
                     conn, submission_id, tenant_code, submission_type, participants_data
                 )
+
+            # Extract challenges and solutions for discussion submission into statements table
+            raw_challenges = data.get("challenges") or []
+            if isinstance(raw_challenges, list):
+                for raw_challenge in raw_challenges:
+                    if raw_challenge:
+                        await insert_statement_with_parent_check(
+                            conn,
+                            submission_id,
+                            tenant_code,
+                            submission_type="discussion",
+                            statement_type="challenge",
+                            raw_text=str(raw_challenge),
+                        )
+
+            raw_solutions = data.get("solutions") or []
+            if isinstance(raw_solutions, list):
+                for raw_solution in raw_solutions:
+                    if raw_solution:
+                        await insert_statement_with_parent_check(
+                            conn,
+                            submission_id,
+                            tenant_code,
+                            submission_type="discussion",
+                            statement_type="solution",
+                            raw_text=str(raw_solution),
+                        )
 
         logger.info(f"Successfully ingested {submission_type} submission {submission_id} under tenant {tenant_code}")
         return {

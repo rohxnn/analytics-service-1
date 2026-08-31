@@ -212,6 +212,44 @@ CREATE TABLE analysis_results (
 );
 
 -- =========================================================================
+-- 8a. STATEMENT EXTRACTION
+-- Individual statements extracted from a submission (challenges, solutions,
+-- questions, answers). parent_id links related statements, e.g. a challenge
+-- that already exists will be set as the parent of the duplicate.
+-- =========================================================================
+
+CREATE TABLE statements (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    submission_id    TEXT NOT NULL,
+    tenant_code      TEXT NOT NULL,
+
+    submission_type  TEXT NOT NULL,
+    statement_type   TEXT NOT NULL,
+    raw_statement    TEXT NOT NULL,
+
+    parent_id        UUID,
+
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (submission_id, tenant_code)
+        REFERENCES submissions(submission_id, tenant_code)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY (parent_id)
+        REFERENCES statements(id)
+        ON DELETE SET NULL
+);
+
+-- Functional index for fast case-insensitive exact-match deduplication.
+-- Without this, the LOWER(raw_statement) = LOWER($1) check in
+-- insert_statement_with_parent_check() would do a full sequential scan
+-- on every insert — a serious bottleneck at 80k+ rows.
+CREATE INDEX idx_statements_raw_statement_lower
+    ON statements (LOWER(raw_statement));
+
+-- =========================================================================
 -- 9. QUALITATIVE SCORING & SUMMARIES
 -- =========================================================================
 
