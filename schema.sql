@@ -242,12 +242,9 @@ CREATE TABLE statements (
         ON DELETE SET NULL
 );
 
--- Functional index for fast case-insensitive exact-match deduplication.
--- Without this, the LOWER(raw_statement) = LOWER($1) check in
--- insert_statement_with_parent_check() would do a full sequential scan
--- on every insert — a serious bottleneck at 80k+ rows.
-CREATE INDEX idx_statements_raw_statement_lower
-    ON statements (LOWER(raw_statement));
+-- Index for fast exact-match deduplication.
+CREATE INDEX idx_statements_raw_statement
+    ON statements (raw_statement);
 
 -- =========================================================================
 -- 9. QUALITATIVE SCORING & SUMMARIES

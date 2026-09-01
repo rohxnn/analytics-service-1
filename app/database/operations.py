@@ -109,12 +109,12 @@ async def insert_statement_with_parent_check(
         str(submission_id), tenant_code, submission_type, statement_type, cleaned
     )
 
-    # Look for an existing statement with exactly the same text (case-insensitive)
+    # Look for an existing statement with exactly the same text
     matched_id = await conn.fetchval(
         """
         SELECT id
         FROM statements
-        WHERE LOWER(raw_statement) = LOWER($1)
+        WHERE raw_statement = $1
           AND id != $2
         LIMIT 1
         """,
