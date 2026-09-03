@@ -440,7 +440,7 @@ async def insert_or_update_submission(
                             conn,
                             submission_id,
                             tenant_code,
-                            submission_type="story",
+                            submission_type=submission_type,
                             statement_type="challenge",
                             raw_text=str(raw_challenge),
                         )
@@ -522,7 +522,7 @@ async def insert_or_update_submission(
                             conn,
                             submission_id,
                             tenant_code,
-                            submission_type="discussion",
+                            submission_type=submission_type,
                             statement_type="challenge",
                             raw_text=str(raw_challenge),
                         )
@@ -535,7 +535,7 @@ async def insert_or_update_submission(
                             conn,
                             submission_id,
                             tenant_code,
-                            submission_type="discussion",
+                            submission_type=submission_type,
                             statement_type="solution",
                             raw_text=str(raw_solution),
                         )
