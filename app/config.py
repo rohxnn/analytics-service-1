@@ -100,6 +100,16 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = Field(default=2048)
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
 
+    # SetFit Statement Categorization
+    SETFIT_MODEL_ID: str = Field(default="PrashantG6838/setfit_category_model_new3")
+    SETFIT_MODEL_VERSION: str = Field(default="v2")
+    SETFIT_CONFIDENCE_THRESHOLD: float = Field(default=0.80)
+
+    # SetFit Thematic Classification model
+    SETFIT_THEME_MODEL_ID: str = Field(default="PrashantG6838/theme_tagging")
+    SETFIT_THEME_MODEL_VERSION: str = Field(default="main")
+    SETFIT_THEME_CONFIDENCE_THRESHOLD: float = Field(default=0.80)
+
     # Story Rating Configuration
     MAX_PDF_TEXT_CHARS: int = Field(default=40000)
 

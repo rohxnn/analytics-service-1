@@ -21,6 +21,7 @@ from app.temporal.deface_blur_activity import deface_blur_activity
 from app.temporal.pii_and_abusive_activity import pii_and_abusive_language_detection_activity
 from app.temporal.thematic_activity import thematic_classification_activity
 from app.temporal.story_rating_activity import story_rating_activity
+from app.temporal.statement_category_activity import statement_category_activity
 from app.temporal.csv_processing_activity import (
     csv_fetch_and_validate_activity,
     csv_push_to_kafka_activity,
@@ -83,6 +84,7 @@ async def start_worker():
         thematic_classification_activity,
         deface_blur_activity,
         story_rating_activity,
+        statement_category_activity,
         update_status_activity,
         fetch_pending_submissions_activity,
         csv_fetch_and_validate_activity,

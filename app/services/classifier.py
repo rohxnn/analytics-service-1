@@ -124,3 +124,53 @@ def classify_statement(
     if not scores:
         return None, 0.0
     return scores[0]
+
+
+# ---------------------------------------------------------------------------
+# Shared SetFit Model Loader & Batch Predictor
+# ---------------------------------------------------------------------------
+
+_setfit_models_cache: Dict[Tuple[str, str], Any] = {}
+_setfit_models_lock = threading.Lock()
+
+
+def load_setfit_model(model_id: str, revision: str = "main"):
+    """
+    Lazily loads and caches SetFit models by (model_id, revision).
+    Thread-safe double-checked locking singleton across worker threads.
+    Always call via asyncio.to_thread().
+    """
+    cache_key = (model_id, revision)
+    if cache_key not in _setfit_models_cache:
+        with _setfit_models_lock:
+            if cache_key not in _setfit_models_cache:
+                from setfit import SetFitModel
+                logger.info(f"Loading SetFit model '{model_id}' (revision={revision})...")
+                _setfit_models_cache[cache_key] = SetFitModel.from_pretrained(
+                    model_id, revision=revision
+                )
+                logger.info(f"SetFit model '{model_id}' loaded successfully.")
+    return _setfit_models_cache[cache_key]
+
+
+def predict_setfit_batch(model, texts: List[str]) -> Tuple[List[str], List[float]]:
+    """
+    Runs batch predictions and softmax probability extraction on any SetFit model.
+    Thread-safe & blocking — call via asyncio.to_thread().
+
+    Returns:
+        (predictions, confidence_scores)
+    """
+    try:
+        import torch
+        probs = model.predict_proba(texts)
+        if isinstance(probs, torch.Tensor):
+            confs = probs.max(dim=1).values.tolist()
+        else:
+            confs = np.asarray(probs).max(axis=1).tolist()
+    except Exception:
+        probs = np.asarray(model.predict_proba(texts))
+        confs = probs.max(axis=1).tolist()
+
+    preds = [str(p) for p in model.predict(texts)]
+    return preds, confs

@@ -13,6 +13,7 @@ with workflow.unsafe.imports_passed_through():
     from app.temporal.pii_and_abusive_activity import pii_and_abusive_language_detection_activity
     from app.temporal.thematic_activity import thematic_classification_activity
     from app.temporal.story_rating_activity import story_rating_activity
+    from app.temporal.statement_category_activity import statement_category_activity
     from app.temporal.csv_processing_activity import (
         csv_fetch_and_validate_activity,
         csv_push_to_kafka_activity,
@@ -136,6 +137,23 @@ class ConfigDrivenProcessingWorkflow:
                     steps_execution[idx]["status"] = status_val
                     steps_execution[idx]["completed_timestamp"] = workflow.now().isoformat()
                     completed_steps.append("story_rating")
+                    workflow.logger.info(f"Completed workflow step: '{step_name}' with status: {status_val}")
+
+                elif step_name == "statement_category":
+                    res = await workflow.execute_activity(
+                        statement_category_activity,
+                        {
+                            "submission_id": submission_id,
+                            "tenant_code": tenant_code,
+                            **llm_overrides,
+                        },
+                        start_to_close_timeout=timedelta(minutes=10),
+                        retry_policy=retry_policy
+                    )
+                    status_val = res.get("status", "success") if isinstance(res, dict) else "success"
+                    steps_execution[idx]["status"] = status_val
+                    steps_execution[idx]["completed_timestamp"] = workflow.now().isoformat()
+                    completed_steps.append("statement_category")
                     workflow.logger.info(f"Completed workflow step: '{step_name}' with status: {status_val}")
 
                 else:
