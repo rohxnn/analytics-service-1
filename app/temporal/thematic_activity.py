@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import re
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 from temporalio import activity
 
@@ -11,11 +12,13 @@ from app.database.db import db
 from app.database.operations import (
     insert_llm_log,
     insert_analysis_result,
-    get_submission_type_and_payload,
+    fetch_challenge_statements_for_submission,
 )
-from app.services.classifier import build_theme_embeddings, get_theme_similarities
+from app.services.classifier import load_setfit_model, predict_setfit_batch
+from app.services.llm import openrouter_chat_completion, split_llm_usage
 
 logger = logging.getLogger("analytics_service.temporal.activities")
+
 
 # Discussion statements may legitimately cover several distinct barriers in one
 # sentence, so they're allowed to map to multiple themes. Story objectives are
@@ -49,7 +52,6 @@ def _is_garbage_or_spam(text: str) -> bool:
         "test", "testing", "demo", "dummy", "asdf", "ghjk", "qwerty", 
         "placeholder", "abc", "xyz", "nothing", "none", "nil", "n/a", "na"
     }
-    # If the text matches a placeholder or all words are placeholders
     if (len(words) == 1 and words[0] in placeholders) or all(w in placeholders for w in words):
         return True
 
@@ -91,7 +93,8 @@ async def _get_theme_classification_prompt(conn, analysis_type: str) -> dict:
         SELECT pv.id, pv.system_prompt, pv.user_prompt
         FROM prompt_version pv
         JOIN prompts p ON p.id = pv.prompt_id
-        WHERE p.analysis_type = $1 AND pv.is_active = TRUE
+        WHERE (p.analysis_type = $1 OR p.analysis_type = 'thematic_classification' OR p.analysis_type = 'theme')
+          AND pv.is_active = TRUE
         ORDER BY pv.created_at DESC
         LIMIT 1
         """,
@@ -111,7 +114,7 @@ def _build_themes_text(approved_themes: list) -> str:
     for theme in approved_themes:
         theme_id = theme["id"]
         name = theme.get("name", "")
-        definition = theme.get("definitions", "") or ""
+        definition = theme.get("definitions", "") or theme.get("definition", "") or ""
         keywords = theme.get("keywords", "") or ""
         lines.append(
             f"Theme ID: {theme_id}\n"
@@ -155,27 +158,24 @@ def _finalize_qualifying_themes(
     """
     best_by_theme: Dict[str, Dict[str, Any]] = {}
     for item in resolved_items:
-        tid = item["theme_id"]
-        if tid is None:
+        tid = item.get("theme_id")
+        if not tid:
             continue
-        if tid not in best_by_theme or item["confidence_score"] > best_by_theme[tid]["confidence_score"]:
+        conf = item["confidence_score"]
+        if conf < settings.LLM_CONFIDENCE_SCORE_THRESHOLD:
+            continue
+        existing = best_by_theme.get(tid)
+        if existing is None or conf > existing["confidence_score"]:
             best_by_theme[tid] = item
 
-    qualifying = [
-        item for item in best_by_theme.values()
-        if item["confidence_score"] >= settings.LLM_CONFIDENCE_SCORE_THRESHOLD
-    ]
-    qualifying.sort(key=lambda x: x["confidence_score"], reverse=True)
-
+    qualifying = sorted(best_by_theme.values(), key=lambda x: x["confidence_score"], reverse=True)
     if not is_discussion:
-        # Story submissions stay single-theme regardless of how many themes qualify
         qualifying = qualifying[:1]
     elif len(qualifying) > MAX_MULTI_THEME_MATCHES:
         logger.warning(
-            f"[Thematic Pipeline] {len(qualifying)} qualifying themes for one statement; capping to top {MAX_MULTI_THEME_MATCHES}."
+            f"[Thematic Pipeline] LLM match found {len(qualifying)} themes above threshold; capping to top {MAX_MULTI_THEME_MATCHES}."
         )
         qualifying = qualifying[:MAX_MULTI_THEME_MATCHES]
-
     return qualifying
 
 
@@ -185,21 +185,19 @@ async def _run_local_classification(
     submission_id: str,
     tenant_code: str,
     statement_type: str,
-    theme_vectors: dict,
-    theme_id_to_info: dict,
     abusive_masked_at: list,
-    is_discussion: bool,
+    statement_id: Optional[str] = None,
+    setfit_conf: Optional[float] = None,
+    setfit_pred: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Runs Steps 2, 3 and 6 for one statement — the word-count/garbage gate, the safety
-    check, and the local embedding match — none of which need an LLM call.
+    Runs the word-count/garbage gate and safety check for statements SetFit was
+    not confident enough to resolve directly. Both gates must pass before the
+    statement is queued for the batched LLM fallback.
 
-    Returns (finished_result, pending_item), exactly one of which is non-None:
-      - finished_result: the statement resolved without the LLM (Unknown/Unclear,
-        Flagged, or a local embedding match clearing SIMILARITY_SCORE_THRESHOLD).
-        Its analysis_results row(s) are already written.
-      - pending_item: the statement needs the LLM fallback batch. Carries everything
-        the batched call needs to finish classification later.
+    Returns (finished_result, pending_item):
+      - finished_result: resolved as Unknown/Unclear or Flagged — row already written.
+      - pending_item: passed both gates; ready for LLM fallback.
     """
     diagnostics = {
         "word_count_check": {
@@ -210,6 +208,8 @@ async def _run_local_classification(
         "safety_check": {
             "passed": False,
             "is_flagged": False,
+            "pii_tag_detected": False,
+            "abusive_flagged_column": False,
         },
         "local_embedding_compare": {
             "similarity_score": 0.0,
@@ -221,13 +221,12 @@ async def _run_local_classification(
             "confidence_score": None,
             "threshold": settings.LLM_CONFIDENCE_SCORE_THRESHOLD,
             "passed": False,
-        }
+        },
     }
     result = {
         "statement": statement,
         "category_type": None,
         "theme_id": None,
-        "similarity_score": None,
         "confidence_score": None,
         "diagnostics": diagnostics,
     }
@@ -244,6 +243,7 @@ async def _run_local_classification(
             conn,
             submission_id=submission_id,
             tenant_code=tenant_code,
+            statement_id=statement_id,
             theme_id=None,
             analysis_type="theme",
             statements=statement,
@@ -258,15 +258,13 @@ async def _run_local_classification(
     logger.info("[Thematic Pipeline] -> PASSED word-count/garbage gate.")
 
     # --- Step 3: Safety check ---
-    logger.info(f"[Thematic Pipeline] Step 3: Checking statement safety (statement-level PII tag scan + column-level abuse flag for {statement_type})")
-    abusive_cols = abusive_masked_at or []
-
     # PII masking runs once per column (see pii_and_abusive_activity.py), so
     # pii_masked_at is a column-level flag — checking column membership here would
     # mark every split statement in that column as Flagged even if only one of
     # them actually contained PII. The masking prompt replaces sensitive spans with
     # tags (<PERSON>, <PHONE>, <ID>, <LOCATION>), so check the statement text itself
     # for one of those tags instead — only the actually-masked statement(s) get flagged.
+    abusive_cols = abusive_masked_at or []
     has_pii_tag = bool(re.search(r'<[A-Z]+>', statement))
     # Abusive language is flagged but never replaced with a tag, so there's no
     # per-statement textual signal to key off — this stays column-level.
@@ -282,6 +280,7 @@ async def _run_local_classification(
             conn,
             submission_id=submission_id,
             tenant_code=tenant_code,
+            statement_id=statement_id,
             theme_id=None,
             analysis_type="theme",
             statements=statement,
@@ -294,69 +293,15 @@ async def _run_local_classification(
         return result, None
 
     diagnostics["safety_check"]["passed"] = True
-    logger.info("[Thematic Pipeline] -> PASSED safety check.")
+    logger.info("[Thematic Pipeline] -> PASSED safety check. Queuing for LLM fallback.")
 
-    # --- Step 5 (themes already fetched) ---
-    # --- Step 6: Local embedding classification ---
-    logger.info("[Thematic Pipeline] Step 6: Comparing against approved themes using local SentenceTransformer embeddings")
-    # SentenceTransformer.encode() is CPU-bound and synchronous — run it off the
-    # event loop so it doesn't block other activities on this Temporal worker.
-    theme_similarities = await asyncio.to_thread(get_theme_similarities, statement, theme_vectors)
-    best_theme_id, best_similarity = theme_similarities[0] if theme_similarities else (None, 0.0)
-    result["similarity_score"] = best_similarity
-    diagnostics["local_embedding_compare"]["similarity_score"] = best_similarity
-
-    if best_similarity >= settings.SIMILARITY_SCORE_THRESHOLD and best_theme_id:
-        diagnostics["local_embedding_compare"]["passed"] = True
-
-        qualifying_local = [
-            (tid, score) for tid, score in theme_similarities
-            if score >= settings.SIMILARITY_SCORE_THRESHOLD
-        ]
-        if not is_discussion:
-            # Story submissions stay single-theme regardless of how many themes clear the threshold
-            qualifying_local = qualifying_local[:1]
-        elif len(qualifying_local) > MAX_MULTI_THEME_MATCHES:
-            logger.warning(
-                f"[Thematic Pipeline] Local match found {len(qualifying_local)} themes above threshold; capping to top {MAX_MULTI_THEME_MATCHES}."
-            )
-            qualifying_local = qualifying_local[:MAX_MULTI_THEME_MATCHES]
-
-        is_multi = len(qualifying_local) > 1
-        result["category_type"] = "Standard"
-        result["theme_id"] = qualifying_local[0][0]
-        result["matched_themes"] = [{"theme_id": tid, "similarity_score": score} for tid, score in qualifying_local]
-
-        for tid, score in qualifying_local:
-            await insert_analysis_result(
-                conn,
-                submission_id=submission_id,
-                tenant_code=tenant_code,
-                theme_id=tid,
-                analysis_type="theme",
-                statements=statement,
-                statement_type=statement_type,
-                category_type="Standard",
-                similarity_score=score,
-                multi_theme_mapped=is_multi,
-                meta_data=diagnostics,
-            )
-
-        theme_names = [theme_id_to_info.get(tid, {}).get("name", "?") for tid, _ in qualifying_local]
-        logger.info(
-            f"[Thematic Pipeline] -> SUCCESSFUL local embedding match{'es' if is_multi else ''}: "
-            f"'{statement[:50]}...' → {theme_names} (sim={[round(s, 3) for _, s in qualifying_local]} >= threshold={settings.SIMILARITY_SCORE_THRESHOLD:.3f})"
-        )
-        return result, None
-
-    logger.info(f"[Thematic Pipeline] -> LOCAL MATCH similarity {best_similarity:.3f} was below threshold={settings.SIMILARITY_SCORE_THRESHOLD:.3f}. Queued for batched LLM fallback.")
-
+    # Both gates passed — queue for batched LLM fallback
     diagnostics["llm_fallback"]["executed"] = True
     pending_item = {
         "statement": statement,
         "statement_type": statement_type,
-        "is_discussion": is_discussion,
-        "best_similarity": best_similarity,
+        "setfit_conf": setfit_conf,
+        "setfit_pred": setfit_pred,
         "diagnostics": diagnostics,
     }
     return None, pending_item
@@ -421,50 +366,33 @@ async def _run_batched_llm_fallback(
         user_prompt = user_prompt.replace("{{approved_themes}}", themes_text)
         user_prompt = user_prompt.replace("{{statements}}", statements_text)
         user_prompt = user_prompt.replace("{{statement}}", statements_text)
-
         full_prompt = f"{system_prompt}\n\n{user_prompt}"
 
-        from app.services.llm import openrouter_chat_completion, split_llm_usage
+        logger.info(
+            f"[Thematic Pipeline] Sending batched prompt for {len(pending_items)} statement(s) "
+            f"to LLM ({resolved_model}, timeout={resolved_timeout}s)..."
+        )
         response_text, usage = await asyncio.to_thread(
             openrouter_chat_completion,
-            full_prompt, model=resolved_model, max_tokens=resolved_max_tokens, timeout=resolved_timeout,
+            prompt=full_prompt,
+            model=resolved_model,
+            max_tokens=resolved_max_tokens,
+            timeout=resolved_timeout,
         )
 
-        # Clean markdown wrappers
-        cleaned = response_text.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            if lines[0].startswith("```json") or lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            cleaned = "\n".join(lines).strip()
+        json_str = response_text
+        if "```json" in json_str:
+            json_str = json_str.split("```json")[1].split("```")[0].strip()
+        elif "```" in json_str:
+            json_str = json_str.split("```")[1].split("```")[0].strip()
 
-        # Fix unquoted UUIDs in the JSON if the LLM outputted them without quotes
-        cleaned = re.sub(
-            r'"theme_id"\s*:\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})',
-            r'"theme_id": "\1"',
-            cleaned
-        )
+        llm_result = json.loads(json_str)
+        raw_classified_data = llm_result.get("classified_data", [])
+        logger.info(f"[Thematic Pipeline] Batched LLM call succeeded; returned {len(raw_classified_data)} classified_data entry/entries.")
 
-        try:
-            llm_result = json.loads(cleaned)
-        except json.JSONDecodeError as jde:
-            logger.error(f"JSON parsing failed for batched LLM response. Error: {jde} (response length={len(response_text)})")
-            raise
-
-        classified_items = []
-        if "classified_data" in llm_result and isinstance(llm_result["classified_data"], list):
-            classified_items = llm_result["classified_data"]
-        else:
-            classified_items = [llm_result]
-
-        # Defensive fallback for entries missing a valid statement_index: match by
-        # the echoed statement text (best-effort only — this is why statement_index
-        # is the primary, required mapping mechanism).
         text_to_index = {item["statement"].strip().lower(): idx for idx, item in enumerate(pending_items)}
 
-        for item in classified_items:
+        for item in raw_classified_data:
             idx = item.get("statement_index")
             if not isinstance(idx, int) or not (0 <= idx < len(pending_items)):
                 echoed = str(item.get("challenge") or item.get("statement") or "").strip().lower()
@@ -507,9 +435,6 @@ async def _run_batched_llm_fallback(
         logger.error(f"[Thematic Pipeline] Batched LLM fallback failed for {len(pending_items)} statement(s): {e}")
         if prompt_version_id is not None:
             try:
-                # Real usage is only available if the API call itself succeeded (e.g. a
-                # later JSON-parse failure) — fall back to a word-count estimate only
-                # when we never got a response to report actual billed tokens for.
                 if usage:
                     prompt_tokens, completion_tokens, usage_meta = split_llm_usage(usage)
                 else:
@@ -532,34 +457,20 @@ async def _run_batched_llm_fallback(
                     )
             except Exception as log_err:
                 logger.error(f"[Thematic Pipeline] Failed to log batched LLM failure to llm_logs: {log_err}")
-
-        # Re-raise rather than falling through to Step 9 with an empty
-        # items_by_index — an HTTP/parsing/logging failure here is an
-        # infrastructure error, not a legitimate low-confidence classification.
-        # Swallowing it would silently persist every pending statement as a
-        # valid-looking "Others" result and report the activity as successful,
-        # which would prevent Temporal's configured RetryPolicy from ever
-        # retrying a transient failure (matching how pii_and_abusive_activity.py
-        # and story_rating_activity.py already re-raise from their own LLM
-        # failure handlers instead of persisting a fabricated result).
         raise
 
-    # --- Step 9: Finalize each pending item using its grouped classified_data entries.
-    # Own connection scope — acquired fresh now that the LLM call (if any) has returned.
     results = []
     async with db.pool.acquire() as conn:
         for idx, pending in enumerate(pending_items):
             statement = pending["statement"]
             statement_type = pending["statement_type"]
             is_discussion = pending["is_discussion"]
-            best_similarity = pending["best_similarity"]
             diagnostics = pending["diagnostics"]
 
             result = {
                 "statement": statement,
                 "category_type": None,
                 "theme_id": None,
-                "similarity_score": best_similarity,
                 "confidence_score": None,
                 "diagnostics": diagnostics,
             }
@@ -577,11 +488,6 @@ async def _run_batched_llm_fallback(
 
             result["confidence_score"] = llm_confidence
             diagnostics["llm_fallback"]["confidence_score"] = llm_confidence
-            # Complete raw LLM response for this batch call, stored on every statement that
-            # went through the fallback (not just the entries that ended up qualifying) so
-            # the full context is available for audit/debugging from any one row. Reaching
-            # this point at all means the try block above succeeded, so llm_result is
-            # always set (a batch call failure re-raises instead of reaching Step 9).
             diagnostics["llm_fallback"]["complete_llm_response"] = llm_result
 
             if qualifying_llm:
@@ -599,13 +505,18 @@ async def _run_batched_llm_fallback(
                         conn,
                         submission_id=submission_id,
                         tenant_code=tenant_code,
+                        statement_id=pending.get("statement_id"),
                         theme_id=item["theme_id"],
                         analysis_type="theme",
                         statements=statement,
                         statement_type=statement_type,
                         category_type="Standard",
-                        confidence_score=item["confidence_score"],
-                        similarity_score=best_similarity,
+                        ml_model_name=resolved_model or settings.OPENROUTER_MODEL,
+                        model_confidence_score=pending.get("setfit_conf"),
+                        model_prediction=pending.get("setfit_pred"),
+                        llm_prediction=item["theme_name"],
+                        threshold=settings.SETFIT_THEME_CONFIDENCE_THRESHOLD,
+                        llm_confidence_score=item["confidence_score"],
                         justification=item["justification"],
                         multi_theme_mapped=is_multi,
                         meta_data=diagnostics,
@@ -617,19 +528,22 @@ async def _run_batched_llm_fallback(
                     f"(conf={[round(item['confidence_score'], 2) for item in qualifying_llm]})"
                 )
             else:
-                # Others — vague, off-taxonomy, low confidence, or the batch call failed entirely
                 result["category_type"] = "Others"
                 await insert_analysis_result(
                     conn,
                     submission_id=submission_id,
                     tenant_code=tenant_code,
+                    statement_id=pending.get("statement_id"),
                     theme_id=None,
                     analysis_type="theme",
                     statements=statement,
                     statement_type=statement_type,
                     category_type="Others",
-                    confidence_score=llm_confidence,
-                    similarity_score=best_similarity,
+                    ml_model_name=resolved_model or settings.OPENROUTER_MODEL,
+                    model_confidence_score=pending.get("setfit_conf"),
+                    model_prediction=pending.get("setfit_pred"),
+                    threshold=settings.SETFIT_THEME_CONFIDENCE_THRESHOLD,
+                    llm_confidence_score=llm_confidence,
                     justification=llm_justification,
                     meta_data=diagnostics,
                 )
@@ -643,112 +557,162 @@ async def _run_batched_llm_fallback(
 @activity.defn
 async def thematic_classification_activity(params: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Temporal activity that performs category-type-gated thematic classification.
+    Temporal activity that performs thematic classification on Challenge statements.
 
-    Pipeline (per statement, via _run_local_classification):
-      Step 1:  Read column config, extract text
-      Step 1b: For discussions, each TEXT[] array element is its own statement (no parsing needed)
-      Step 2:  Word-count / garbage gate → Unknown/Unclear
-      Step 3:  Safety check (no LLM) → Flagged
-      Step 4:  STOP point for Unknown/Flagged
-      Step 5:  Fetch approved themes
-      Step 6:  Local embedding classification → Standard, or queued for fallback
-
-    Then once for the whole submission (via _run_batched_llm_fallback), covering every
-    statement across every column that didn't clear the local threshold:
-      Step 7:  Build ONE LLM prompt listing all queued statements by index
-      Step 8:  Call LLM once, parse confidence per statement_index
-      Step 9:  Finalize category_type per statement (Standard / Others)
+    Logic:
+      1. Fetch Challenge-classified statements from analysis_results + statements.
+      2. Run SetFit batch inference (PrashantG6838/theme_tagging).
+      3. Confident SetFit hits (>= 0.80) are safety-checked and inserted as Standard/Flagged.
+      4. Low-confidence statements (< 0.80) pass word-count and safety gates in _run_local_classification.
+      5. Statements passing both gates are batched into ONE LLM fallback call.
     """
-    submission_id = params["submission_id"]
-    tenant_code = params["tenant_code"]
-    target_columns = params["target_columns"]
-    analysis_type = params.get("analysis_type", "thematic_classification")
-    resolved_model = params.get("llm_model") or settings.OPENROUTER_MODEL
+    submission_id = params.get("submission_id")
+    tenant_code = params.get("tenant_code")
+    resolved_model = params.get("model") or settings.OPENROUTER_MODEL
     resolved_max_tokens = params.get("max_tokens") or settings.LLM_MAX_TOKENS
-    resolved_timeout = params.get("llm_timeout_seconds") or settings.LLM_TIMEOUT_SECONDS
+    resolved_timeout = params.get("timeout") or params.get("llm_timeout_seconds") or settings.LLM_TIMEOUT_SECONDS
 
-    if not target_columns:
-        return {"status": "skipped", "reason": "no columns specified"}
+    if not submission_id or not tenant_code:
+        raise ValueError("submission_id and tenant_code are required.")
+
+    logger.info(f"[Thematic Pipeline] Starting activity for submission={submission_id}, tenant={tenant_code}")
 
     async with db.pool.acquire() as conn:
-        sub_type, payload = await get_submission_type_and_payload(conn, submission_id, tenant_code)
+        challenge_statements = await fetch_challenge_statements_for_submission(conn, submission_id, tenant_code)
+        if not challenge_statements:
+            logger.info(f"[Thematic Pipeline] No Challenge statements found for submission={submission_id}.")
+            return {
+                "status": "success",
+                "processed": 0,
+                "results": [],
+                "warnings": ["No Challenge statements found for submission."],
+            }
 
-        # --- Step 5: Fetch approved themes (once per activity invocation) ---
-        warnings = []
         approved_themes = await _fetch_approved_themes(conn)
-        if not approved_themes:
-            warn_msg = "No approved themes found in database. All statements will go to LLM fallback."
-            logger.warning(warn_msg)
-            warnings.append(warn_msg)
-
-        # Build embedding vectors for approved themes (once). Same as below — this
-        # calls SentenceTransformer.encode() synchronously, so it's offloaded to a
-        # thread rather than blocking the event loop.
-        theme_id_to_info = {str(t["id"]): t for t in approved_themes}
-        theme_vectors = await asyncio.to_thread(build_theme_embeddings, approved_themes) if approved_themes else {}
-
-        abusive_masked_at = payload.get("abusive_masked_at") or []
-
-        # Clear existing analysis results for this submission's theme analysis
-        await conn.execute(
-            "DELETE FROM analysis_results WHERE submission_id = $1 AND tenant_code = $2 AND analysis_type = 'theme'",
-            submission_id, tenant_code
+        abusive_masked_at_row = await conn.fetchrow(
+            """
+            SELECT ss.abusive_masked_at FROM submissions sub
+            LEFT JOIN story_submissions ss
+                ON ss.submission_id = sub.submission_id AND ss.tenant_code = sub.tenant_code
+            LEFT JOIN discussion_submissions ds
+                ON ds.submission_id = sub.submission_id AND ds.tenant_code = sub.tenant_code
+            WHERE sub.submission_id = $1 AND sub.tenant_code = $2
+            """,
+            submission_id, tenant_code,
+        )
+        abusive_masked_at: List[str] = (
+            list(abusive_masked_at_row["abusive_masked_at"] or [])
+            if abusive_masked_at_row and abusive_masked_at_row["abusive_masked_at"]
+            else []
         )
 
-        all_results = []
-        # Statements that don't clear the local embedding threshold anywhere in this
-        # submission are batched into a single LLM call at the end, instead of one
-        # call per statement — the fixed cost of the prompt (rules + the full
-        # approved-themes catalog) is then paid once per submission, not once per
-        # statement needing the fallback.
-        pending_items = []
+    warnings = []
+    if not approved_themes:
+        warn_msg = "No approved themes found in database. All statements will go to LLM fallback."
+        logger.warning(warn_msg)
+        warnings.append(warn_msg)
 
-        for col in target_columns:
-            # Map column name to DB column
-            db_col = "challenge" if col == "challenges" and sub_type == "story" else col
-            raw_value = payload.get(db_col)
-            if not raw_value:
-                continue
+    theme_id_to_info = {str(t["id"]): t for t in approved_themes}
 
-            # --- Step 1b: Build the list of statements to classify ---
-            is_discussion = "discussion" in sub_type
-            # Branch on the column's actual runtime shape, not submission type —
-            # TEXT[] columns (discussion's challenges/solutions, story's
-            # challenge/action_steps; see operations.py's _normalize_statement_list)
-            # come back from asyncpg as a native Python list, one element per
-            # discrete statement. No delimiter/JSON parsing needed (and none would
-            # be safe, since a statement could legitimately contain any given
-            # delimiter character itself). Scalar TEXT columns (e.g. a story's
-            # objective) are processed as a single unit.
-            if isinstance(raw_value, list):
-                statements = [str(s).strip() for s in raw_value if s and str(s).strip()]
+    # Clear previous theme analysis_results for idempotency
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM analysis_results WHERE submission_id = $1 AND tenant_code = $2 AND analysis_type = 'theme'",
+            submission_id, tenant_code,
+        )
+
+    # Step 1 — SetFit theme model: batch inference on all Challenge statements
+    setfit_model = await asyncio.to_thread(
+        load_setfit_model,
+        settings.SETFIT_THEME_MODEL_ID,
+        settings.SETFIT_THEME_MODEL_VERSION,
+    )
+    texts = [s["raw_statement"] for s in challenge_statements]
+    setfit_preds, setfit_confs = await asyncio.to_thread(predict_setfit_batch, setfit_model, texts)
+
+    setfit_resolved_count = 0
+    pending_items: List[Dict] = []
+    all_results: List[Dict] = []
+
+    async with db.pool.acquire() as conn:
+        for stmt, pred, conf in zip(challenge_statements, setfit_preds, setfit_confs):
+            statement      = stmt["raw_statement"]
+            statement_type = stmt["statement_type"]
+            statement_id   = stmt["statement_id"]
+            is_discussion  = True
+
+            if conf >= settings.SETFIT_THEME_CONFIDENCE_THRESHOLD:
+                has_pii_tag = bool(re.search(r'<[A-Z]+>', statement))
+                is_abusive_flagged_column = statement_type in abusive_masked_at
+                flagged = has_pii_tag or is_abusive_flagged_column
+
+                if flagged:
+                    reason = "PII mask tag" if has_pii_tag else f"abusive column ({statement_type})"
+                    logger.info(f"[Thematic Pipeline] SetFit confident but FLAGGED ({reason}): '{statement[:80]}'")
+                    await insert_analysis_result(
+                        conn,
+                        submission_id=submission_id,
+                        tenant_code=tenant_code,
+                        statement_id=statement_id,
+                        analysis_type="theme",
+                        statement_type=statement_type,
+                        category_type="Flagged",
+                        threshold=settings.SETFIT_THEME_CONFIDENCE_THRESHOLD,
+                    )
+                    all_results.append({"statement": statement, "category_type": "Flagged"})
+                    setfit_resolved_count += 1
+                    continue
+
+                resolved_theme_id = _resolve_theme_id(pred, theme_id_to_info)
+                cat_type = "Standard" if resolved_theme_id else "Others"
+
+                logger.info(
+                    f"[Thematic Pipeline] SetFit resolved '{statement[:60]}' → theme='{pred}' ({cat_type}, conf={conf:.3f})"
+                )
+                await insert_analysis_result(
+                    conn,
+                    submission_id=submission_id,
+                    tenant_code=tenant_code,
+                    statement_id=statement_id,
+                    analysis_type="theme",
+                    statement_type=statement_type,
+                    theme_id=resolved_theme_id,
+                    category_type=cat_type,
+                    ml_model_name=settings.SETFIT_THEME_MODEL_ID,
+                    ml_model_version=settings.SETFIT_THEME_MODEL_VERSION,
+                    model_confidence_score=conf,
+                    model_prediction=pred,
+                    threshold=settings.SETFIT_THEME_CONFIDENCE_THRESHOLD,
+                )
+                all_results.append({
+                    "statement": statement,
+                    "category_type": cat_type,
+                    "theme_id": resolved_theme_id,
+                })
+                setfit_resolved_count += 1
+
             else:
-                raw_text = str(raw_value).strip()
-                statements = [raw_text] if raw_text else []
-
-            if not statements:
-                continue
-
-            for statement in statements:
+                logger.info(
+                    f"[Thematic Pipeline] SetFit conf {conf:.3f} < threshold {settings.SETFIT_THEME_CONFIDENCE_THRESHOLD:.3f} for '{statement[:60]}' — queued for local pipeline."
+                )
                 finished_result, pending_item = await _run_local_classification(
                     conn=conn,
                     statement=statement,
                     submission_id=submission_id,
                     tenant_code=tenant_code,
-                    statement_type=col,
-                    theme_vectors=theme_vectors,
-                    theme_id_to_info=theme_id_to_info,
+                    statement_type=statement_type,
                     abusive_masked_at=abusive_masked_at,
-                    is_discussion=is_discussion,
+                    statement_id=statement_id,
+                    setfit_conf=conf,
+                    setfit_pred=pred,
                 )
                 if finished_result is not None:
                     all_results.append(finished_result)
                 else:
+                    pending_item["statement_id"] = statement_id
+                    pending_item["is_discussion"] = is_discussion
                     pending_items.append(pending_item)
 
-    # conn released above — _run_batched_llm_fallback manages its own connection
-    # scopes internally so no pool connection is held idle during its LLM call.
     if pending_items:
         fallback_results = await _run_batched_llm_fallback(
             pending_items=pending_items,
@@ -756,27 +720,23 @@ async def thematic_classification_activity(params: Dict[str, Any]) -> Dict[str, 
             theme_id_to_info=theme_id_to_info,
             submission_id=submission_id,
             tenant_code=tenant_code,
-            analysis_type=analysis_type,
+            analysis_type="theme",
             resolved_model=resolved_model,
             resolved_max_tokens=resolved_max_tokens,
             resolved_timeout=resolved_timeout,
         )
         all_results.extend(fallback_results)
 
-    # Summary
-    quality_counts = {}
-    multi_theme_statement_count = 0
-    for r in all_results:
-        q = r.get("category_type", "unknown")
-        quality_counts[q] = quality_counts.get(q, 0) + 1
-        if len(r.get("matched_themes") or []) > 1:
-            multi_theme_statement_count += 1
+    logger.info(
+        f"[Thematic Pipeline] Done. Processed {len(all_results)} statement(s) "
+        f"({setfit_resolved_count} by SetFit, {len(all_results) - setfit_resolved_count} by fallback/gates)."
+    )
 
     return {
         "status": "success",
-        "total_statements": len(all_results),
-        "quality_breakdown": quality_counts,
-        "multi_theme_statement_count": multi_theme_statement_count,
-        "warnings": warnings,
+        "submission_id": submission_id,
+        "processed": len(all_results),
+        "setfit_resolved": setfit_resolved_count,
         "results": all_results,
+        "warnings": warnings,
     }
