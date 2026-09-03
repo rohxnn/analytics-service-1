@@ -90,44 +90,49 @@ async def insert_statement_with_parent_check(
     raw_text: str,
 ) -> None:
     """
-    Cleans raw_text, inserts it into the statements table, then checks whether
-    an identical statement (case-insensitive) already exists. If one is found
-    the newly inserted row's parent_id is set to that existing statement's UUID id.
+    Cleans raw_text, checks whether an identical statement (case-insensitive)
+    already exists as a root, then inserts the new row with parent_id pre-populated
+    if a match was found.
+
+    Uses a check-before-insert pattern to avoid an extra UPDATE round-trip:
+      old: INSERT → SELECT → UPDATE  (3 round-trips on duplicates)
+      new: SELECT → INSERT           (2 round-trips max, 1 on uniques)
     """
     cleaned = clean_statement(raw_text)
     if not cleaned:
         return
 
-    # Insert the new statement and get its id back
-    new_id = await conn.fetchval(
-        """
-        INSERT INTO statements
-            (submission_id, tenant_code, submission_type, statement_type, raw_statement)
-        VALUES ($1, $2, $3, $4, $5)
-        RETURNING id
-        """,
-        str(submission_id), tenant_code, submission_type, statement_type, cleaned
-    )
-
-    # Look for an existing statement with exactly the same text
-    matched_id = await conn.fetchval(
+    # Check for an existing root statement with the same text (case-insensitive).
+    # - LOWER() ensures the match is truly case-insensitive (= operator is case-sensitive in PG).
+    # - AND parent_id IS NULL ensures we only link to root statements, preventing deep chains.
+    # - ORDER BY created_at ASC guarantees we get the oldest/original statement when
+    #   multiple matches exist (LIMIT 1 alone is non-deterministic).
+    existing_id = await conn.fetchval(
         """
         SELECT id
         FROM statements
-        WHERE raw_statement = $1
-          AND id != $2
+        WHERE LOWER(raw_statement) = LOWER($1)
+          AND parent_id IS NULL
+        ORDER BY created_at ASC
         LIMIT 1
         """,
-        cleaned, new_id
+        cleaned,
     )
 
-    if matched_id:
-        await conn.execute(
-            "UPDATE statements SET parent_id = $1, updated_at = now() WHERE id = $2",
-            matched_id, new_id
-        )
+    # Insert with parent_id already set if a duplicate root was found — no UPDATE needed.
+    new_id = await conn.fetchval(
+        """
+        INSERT INTO statements
+            (submission_id, tenant_code, submission_type, statement_type, raw_statement, parent_id)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id
+        """,
+        str(submission_id), tenant_code, submission_type, statement_type, cleaned, existing_id,
+    )
+
+    if existing_id:
         logger.info(
-            f"Statement [{new_id}] matched existing statement [{matched_id}] — parent_id assigned."
+            f"Statement [{new_id}] matched existing root statement [{existing_id}] — parent_id assigned at insert."
         )
     else:
         logger.info(f"Statement [{new_id}] stored with no duplicate found.")
@@ -427,10 +432,9 @@ async def insert_or_update_submission(
                 )
 
             # Extract challenges for story submission into statements table
-            raw_story_challenges = data.get("challenges") or data.get("challenge")
-            if raw_story_challenges:
-                challenges_list = raw_story_challenges if isinstance(raw_story_challenges, list) else [raw_story_challenges]
-                for raw_challenge in challenges_list:
+            raw_story_challenges = data.get("challenges") or []
+            if isinstance(raw_story_challenges, list):
+                for raw_challenge in raw_story_challenges:
                     if raw_challenge:
                         await insert_statement_with_parent_check(
                             conn,
@@ -615,44 +619,77 @@ async def insert_analysis_result(
     conn: asyncpg.Connection,
     submission_id: str,
     tenant_code: str,
-    theme_id: Optional[str],
     analysis_type: str,
-    statements: str,
-    statement_type: str,
-    confidence_score: Optional[float] = None,
-    justification: Optional[str] = None,
-    category_type: Optional[str] = None,
+    statement_id: Optional[Any] = None,
+    analysis_column: Optional[List[str]] = None,
+    statement_type: Optional[str] = None,
+    statements: Optional[str] = None,
+    ml_model_name: Optional[str] = None,
+    ml_model_version: Optional[str] = None,
+    model_confidence_score: Optional[float] = None,
     similarity_score: Optional[float] = None,
+    confidence_score: Optional[float] = None,
+    model_prediction: Optional[str] = None,
+    llm_confidence_score: Optional[float] = None,
+    llm_prediction: Optional[str] = None,
+    threshold: Optional[float] = None,
+    theme_id: Optional[Any] = None,
+    justification: Optional[str] = None,
     multi_theme_mapped: bool = False,
-    meta_data: Optional[Dict[str, Any]] = None
+    category_type: Optional[str] = None,
+    meta_data: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Saves theme/environmental extraction analysis output to database.
+    Single unified database function to insert rows into analysis_results.
+    Handles all analysis types:
+      - statement_category (SetFit + LLM fallback)
+      - thematic classification
+      - environmental & future analysis steps
+    Supports alias mapping (e.g. statement_type -> analysis_column, similarity_score -> model_confidence_score).
     """
-    if similarity_score is not None:
-        similarity_score = round(similarity_score, 2)
+    # Map statement_type to analysis_column if analysis_column not explicitly passed
+    if analysis_column is None and statement_type is not None:
+        analysis_column = [statement_type]
+
+    # Map legacy confidence score to model_confidence_score only if explicitly not set
+    if model_confidence_score is None and confidence_score is not None:
+        model_confidence_score = confidence_score
+    # NOTE: similarity_score (cosine embedding similarity) is intentionally NOT aliased
+    # to model_confidence_score — they are distinct concepts.
+
     meta_json = json.dumps(meta_data) if meta_data else None
+
     await conn.execute(
         """
         INSERT INTO analysis_results (
-            submission_id, tenant_code, theme_id, analysis_type, statements,
-            statement_type, confidence_score, justification, category_type,
-            similarity_score, multi_theme_mapped, meta_data
+            submission_id, tenant_code, statement_id,
+            analysis_type, analysis_column,
+            ml_model_name, ml_model_version,
+            model_confidence_score, model_prediction,
+            llm_confidence_score, llm_prediction,
+            threshold, theme_id,
+            justification, multi_theme_mapped,
+            category_type, meta_data
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         """,
-        submission_id,
+        str(submission_id),
         tenant_code,
-        theme_id,
+        str(statement_id) if statement_id else None,
         analysis_type,
-        statements,
-        statement_type,
-        confidence_score,
+        analysis_column,
+        ml_model_name,
+        ml_model_version,
+        model_confidence_score,
+        model_prediction,
+        llm_confidence_score,
+        llm_prediction,
+        threshold,
+        str(theme_id) if theme_id else None,
         justification,
-        category_type,
-        similarity_score,
         multi_theme_mapped,
-        meta_json
+        category_type,
+        meta_json,
     )
 
 
@@ -896,3 +933,67 @@ async def try_claim_for_processing(record_id: int) -> Optional[str]:
             return None
         return "in_progress"
 
+
+async def fetch_statements_for_submission(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+) -> List[Dict[str, Any]]:
+    """
+    Fetches all original (non-duplicate) statements for a given submission.
+    Skips rows that have a parent_id set (i.e., duplicates).
+    Returns rows ordered by creation time.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT id, raw_statement, statement_type, submission_type
+        FROM statements
+        WHERE submission_id = $1
+          AND tenant_code = $2
+          AND parent_id IS NULL
+        ORDER BY created_at ASC
+        """,
+        str(submission_id), tenant_code
+    )
+    return [dict(row) for row in rows]
+
+
+async def fetch_challenge_statements_for_submission(
+    conn: asyncpg.Connection,
+    submission_id: str,
+    tenant_code: str,
+) -> List[Dict[str, Any]]:
+    """
+    Returns statements that the statement_category step classified as 'Challenge',
+    ready for thematic classification.
+
+    Effective-category resolution rule (applied in SQL):
+      - If llm_prediction IS NOT NULL  → use llm_prediction
+      - Else                           → use model_prediction
+    Only rows where the effective category equals 'Challenge' are returned.
+
+    Each row contains:
+      statement_id  (UUID, FK into statements)
+      raw_statement (the cleaned text to classify)
+      statement_type ('challenge' / 'solution' / …)
+    """
+    rows = await conn.fetch(
+        """
+        SELECT
+            ar.statement_id,
+            s.raw_statement,
+            s.statement_type
+        FROM analysis_results ar
+        JOIN statements s ON s.id = ar.statement_id
+        WHERE ar.submission_id  = $1
+          AND ar.tenant_code    = $2
+          AND ar.analysis_type  = 'statement_category'
+          AND (
+              (ar.llm_prediction IS NULL     AND LOWER(ar.model_prediction) = 'challenge')
+           OR (ar.llm_prediction IS NOT NULL AND LOWER(ar.llm_prediction)   = 'challenge')
+          )
+        ORDER BY ar.created_at ASC
+        """,
+        str(submission_id), tenant_code,
+    )
+    return [dict(row) for row in rows]
