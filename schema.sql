@@ -206,8 +206,8 @@ CREATE TABLE statements (
 
     parent_id        UUID,
 
-    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     FOREIGN KEY (submission_id, tenant_code)
         REFERENCES submissions(submission_id, tenant_code)
@@ -221,6 +221,9 @@ CREATE TABLE statements (
 -- Expression index for fast case-insensitive deduplication (matches LOWER() query).
 CREATE INDEX idx_statements_raw_lower
     ON statements (LOWER(raw_statement));
+
+CREATE INDEX idx_statements_submission_parent ON statements (submission_id, parent_id);
+CREATE INDEX idx_statements_parent ON statements (parent_id) WHERE parent_id IS NOT NULL;
 
 -- =========================================================================
 -- Trigger: automatically promote a duplicate child to be the new parent
@@ -302,8 +305,8 @@ CREATE TABLE analysis_results (
 
     meta_data               JSONB,
 
-    created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     FOREIGN KEY (submission_id, tenant_code)
         REFERENCES submissions(submission_id, tenant_code)
@@ -430,6 +433,7 @@ CREATE INDEX idx_programs_leader ON programs (leaders_id);
 -- Theme-specific analytics
 CREATE INDEX idx_analysis_results_theme ON analysis_results (theme_id) WHERE theme_id IS NOT NULL;
 CREATE INDEX idx_analysis_results_type ON analysis_results (analysis_type);
+CREATE INDEX idx_analysis_results_statement ON analysis_results (statement_id) WHERE statement_id IS NOT NULL;
 
 -- Prompt version active check
 CREATE INDEX idx_prompt_version_active ON prompt_version (prompt_id) WHERE is_active = TRUE;
