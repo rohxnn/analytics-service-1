@@ -578,12 +578,12 @@ async def thematic_classification_activity(params: Dict[str, Any]) -> Dict[str, 
     async with db.pool.acquire() as conn:
         challenge_statements = await fetch_challenge_statements_for_submission(conn, submission_id, tenant_code)
         if not challenge_statements:
-            logger.info(f"[Thematic Pipeline] No Challenge statements found for submission={submission_id}.")
+            logger.info(f"[Thematic Pipeline] No Challenge/Solution statements found for submission={submission_id}.")
             return {
                 "status": "success",
                 "processed": 0,
                 "results": [],
-                "warnings": ["No Challenge statements found for submission."],
+                "warnings": ["No Challenge or Solution statements found for submission."],
             }
 
         approved_themes = await _fetch_approved_themes(conn)

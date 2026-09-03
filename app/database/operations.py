@@ -964,13 +964,13 @@ async def fetch_challenge_statements_for_submission(
     tenant_code: str,
 ) -> List[Dict[str, Any]]:
     """
-    Returns statements that the statement_category step classified as 'Challenge',
+    Returns statements that the statement_category step classified as 'Challenge' or 'Solution or Action',
     ready for thematic classification.
 
     Effective-category resolution rule (applied in SQL):
       - If llm_prediction IS NOT NULL  → use llm_prediction
       - Else                           → use model_prediction
-    Only rows where the effective category equals 'Challenge' are returned.
+    Only rows where the effective category is 'Challenge', 'Solution', or 'Solution or Action' are returned.
 
     Each row contains:
       statement_id  (UUID, FK into statements)
@@ -989,8 +989,8 @@ async def fetch_challenge_statements_for_submission(
           AND ar.tenant_code    = $2
           AND ar.analysis_type  = 'statement_category'
           AND (
-              (ar.llm_prediction IS NULL     AND LOWER(ar.model_prediction) = 'challenge')
-           OR (ar.llm_prediction IS NOT NULL AND LOWER(ar.llm_prediction)   = 'challenge')
+              (ar.llm_prediction IS NULL     AND LOWER(ar.model_prediction) IN ('challenge', 'solution', 'solution or action'))
+           OR (ar.llm_prediction IS NOT NULL AND LOWER(ar.llm_prediction)   IN ('challenge', 'solution', 'solution or action'))
           )
         ORDER BY ar.created_at ASC
         """,
