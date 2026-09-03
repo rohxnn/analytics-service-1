@@ -113,7 +113,7 @@ async def insert_statement_with_parent_check(
         FROM statements
         WHERE LOWER(raw_statement) = LOWER($1)
           AND parent_id IS NULL
-        ORDER BY created_at ASC
+        ORDER BY created_at ASC, id ASC
         LIMIT 1
         """,
         cleaned,
