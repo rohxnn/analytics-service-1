@@ -222,6 +222,7 @@ CREATE TABLE statements (
 CREATE INDEX idx_statements_raw_lower
     ON statements (LOWER(raw_statement));
 
+-- Submission lookup + cascade delete path.
 CREATE INDEX idx_statements_submission_parent ON statements (submission_id, parent_id);
 CREATE INDEX idx_statements_parent ON statements (parent_id) WHERE parent_id IS NOT NULL;
 
@@ -420,6 +421,7 @@ CREATE INDEX idx_submission_metrics_tenant ON submission_metrics (tenant_code);
 -- Composite query mapping indexes (Foreign key performance optimization)
 CREATE INDEX idx_discussion_submission_mapping ON discussion_submissions (submission_id, tenant_code);
 CREATE INDEX idx_story_submission_mapping ON story_submissions (submission_id, tenant_code);
+CREATE INDEX idx_statements_submission_mapping ON statements (submission_id);
 CREATE INDEX idx_llm_logs_submission_mapping ON llm_logs (submission_id, tenant_code);
 CREATE INDEX idx_analysis_results_submission_mapping ON analysis_results (submission_id, tenant_code);
 CREATE INDEX idx_ranking_submission_mapping ON ranking (submission_id, tenant_code);
