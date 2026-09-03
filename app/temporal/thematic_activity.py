@@ -207,9 +207,7 @@ async def _run_local_classification(
         },
         "safety_check": {
             "passed": False,
-            "is_flagged": False,
-            "pii_tag_detected": False,
-            "abusive_flagged_column": False,
+            "is_flagged": False
         },
         "local_embedding_compare": {
             "similarity_score": 0.0,
