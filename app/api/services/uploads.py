@@ -675,24 +675,6 @@ async def handle_upload(
     if is_duplicate:
         raise DuplicateFile("FILE ALREADY EXISTS")
 
-    # Validate columns FIRST — reject before touching GCS or the DB, so a
-    # malformed CSV never leaves cloud-storage or tracking-table clutter behind.
-    try:
-        df = await asyncio.to_thread(pd.read_csv, io.BytesIO(file_bytes))
-    except Exception as exc:
-        raise InvalidCsvColumns([f"Failed to parse CSV: {exc}"])
-
-    is_valid, errors = await asyncio.to_thread(validate_columns, df, normalized_type)
-    if not is_valid:
-        raise InvalidCsvColumns(errors)
-
-    # Upload to GCS
-    try:
-        cloud_storage_path = await asyncio.to_thread(upload_csv, file_bytes, normalized_type, file_name)
-    except Exception as exc:
-        logger.error("GCS Upload failed: %s", exc)
-        raise RuntimeError(f"GCS Upload failed: {exc}. Please verify GCS settings.")
-
     meta_data = {
         "original_filename": file_name,
         "program_name": program_name,
@@ -700,6 +682,73 @@ async def handle_upload(
         "report_type": normalized_type,
         "tenant_code": tenant_code,
     }
+
+    # Validate CSV content and structure
+    parse_errors = []
+    df = None
+    try:
+        df = await asyncio.to_thread(pd.read_csv, io.BytesIO(file_bytes))
+    except Exception as exc:
+        parse_errors = [f"Failed to parse CSV: {exc}"]
+
+    validation_errors = []
+    if df is not None:
+        is_valid, errors = await asyncio.to_thread(validate_columns, df, normalized_type)
+        if not is_valid:
+            validation_errors = errors
+
+    all_errors = parse_errors or validation_errors
+
+    if all_errors:
+        cloud_storage_path = f"invalid_uploads/{file_name}"
+        try:
+            cloud_storage_path = await asyncio.to_thread(upload_csv, file_bytes, normalized_type, file_name)
+        except Exception:
+            pass
+
+        meta_data["error"] = "CSV validation failed"
+        meta_data["validation_errors"] = all_errors
+
+        try:
+            record_id = await operations.insert_upload_record(
+                report_type=normalized_type,
+                program_name=program_name,
+                leader_category=leader_category,
+                cloud_storage_path=cloud_storage_path,
+                file_name=file_name,
+                file_size=file_size,
+                meta_data=meta_data,
+                status="failed",
+            )
+            logger.warning(
+                "CSV upload validation failed (record_id=%s, status=failed): %s",
+                record_id, all_errors,
+            )
+        except Exception as insert_err:
+            logger.error("Failed to record failed upload in DB: %s", insert_err)
+
+        raise InvalidCsvColumns(all_errors)
+
+    # Upload valid file to GCS
+    try:
+        cloud_storage_path = await asyncio.to_thread(upload_csv, file_bytes, normalized_type, file_name)
+    except Exception as exc:
+        logger.error("GCS Upload failed: %s", exc)
+        meta_data["error"] = f"GCS Upload failed: {exc}"
+        try:
+            await operations.insert_upload_record(
+                report_type=normalized_type,
+                program_name=program_name,
+                leader_category=leader_category,
+                cloud_storage_path="gcs_upload_failed",
+                file_name=file_name,
+                file_size=file_size,
+                meta_data=meta_data,
+                status="failed",
+            )
+        except Exception:
+            pass
+        raise RuntimeError(f"GCS Upload failed: {exc}. Please verify GCS settings.")
 
     record_id = await operations.insert_upload_record(
         report_type=normalized_type,
