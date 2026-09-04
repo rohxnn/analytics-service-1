@@ -448,18 +448,24 @@ Detect and **mask** profanity, insults, hate speech, threats, slurs, and harassm
 
 Return ONLY a valid JSON object (strict JSON, no explanation outside JSON). One entry per column in {columns}. Never omit any key — use empty arrays and false for clean columns.
 
+When input for a column is a list of statements, output an array of objects, one per statement:
 {
-  "<column_name>": {
-    "masked_text": "...",
-    "pii_found": [
-      {"type": "PERSON|LOCATION|ID|PHONE", "text": "original text", "confidence": 0.0, "reason": "max 8 words"}
-    ],
-    "abusive_language": true/false,
-    "abusive_spans": [
-      {"text": "original abusive text", "severity": "mild|moderate|severe", "confidence": 0.0, "reason": "max 8 words"}
-    ]
-  }
+  "<column_name>": [
+    {
+      "statement_index": 0,
+      "masked_text": "...",
+      "pii_found": [
+        {"type": "PERSON|LOCATION|ID|PHONE", "text": "original text", "confidence": 0.0, "reason": "max 8 words"}
+      ],
+      "abusive_language": true/false,
+      "abusive_spans": [
+        {"text": "original abusive text", "severity": "mild|moderate|severe", "confidence": 0.0, "reason": "max 8 words"}
+      ]
+    }
+  ]
 }
+
+CRITICAL: an array output MUST have exactly one entry per input statement, in the same order, with "statement_index" matching that position. Never merge, drop, or reorder statements.
 
 Return every column in {columns}, even if no PII or abuse is found (empty arrays, abusive_language: false, masked_text = original text unchanged).',
   -- user_prompt: text placeholder
