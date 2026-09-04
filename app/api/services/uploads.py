@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime
 import pandas as pd
@@ -395,15 +396,27 @@ def _get_producer() -> Producer:
 
 def _push_rows_sync(payloads: List[Any]) -> None:
     """
-    Runs in a worker thread (via asyncio.to_thread) — produce()/flush() are
-    blocking calls. Flushes once for the whole batch rather than per row.
+    Runs in a worker thread (via asyncio.to_thread) — produce()/poll() are
+    blocking calls. Tracks delivery callbacks specifically for this batch,
+    preventing process-wide flush() interference between concurrent CSV uploads.
     """
+    if not payloads:
+        return
+
     producer = _get_producer()
-    delivery_error = {}
+    pending_count = len(payloads)
+    delivery_error = None
+    done_event = threading.Event()
+    lock = threading.Lock()
 
     def _on_delivery(err, _msg):
-        if err is not None:
-            delivery_error["error"] = err
+        nonlocal pending_count, delivery_error
+        with lock:
+            if err is not None and delivery_error is None:
+                delivery_error = err
+            pending_count -= 1
+            if pending_count <= 0:
+                done_event.set()
 
     for payload, key in payloads:
         producer.produce(
@@ -413,14 +426,28 @@ def _push_rows_sync(payloads: List[Any]) -> None:
             callback=_on_delivery,
         )
         producer.poll(0)
-        if "error" in delivery_error:
-            raise KafkaException(delivery_error["error"])
+        with lock:
+            if delivery_error is not None:
+                raise KafkaException(delivery_error)
 
-    remaining = producer.flush(10)
-    if remaining > 0:
-        raise TimeoutError(f"Timed out waiting for Kafka delivery ({remaining} still in-flight)")
-    if "error" in delivery_error:
-        raise KafkaException(delivery_error["error"])
+    # Poll network events until all delivery callbacks for THIS batch complete
+    timeout_seconds = 30.0
+    start_time = time.time()
+    while not done_event.is_set():
+        producer.poll(0.1)
+        with lock:
+            if delivery_error is not None:
+                raise KafkaException(delivery_error)
+        if time.time() - start_time > timeout_seconds:
+            break
+
+    with lock:
+        if delivery_error is not None:
+            raise KafkaException(delivery_error)
+        if pending_count > 0:
+            raise TimeoutError(
+                f"Timed out waiting for batch Kafka delivery ({pending_count} of {len(payloads)} remaining)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +636,7 @@ async def process_csv_inline(record_id: int, file_bytes: Optional[bytes] = None)
                 "exception": str(exc),
                 "timestamp": datetime.utcnow().isoformat() + "Z",
             }
-            await operations.update_status(record_id, "on_hold", error_meta)
+            await operations.update_status(record_id, "pending", error_meta)
             return
 
     # --- 6. Update status to success ---
