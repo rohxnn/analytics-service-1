@@ -717,14 +717,15 @@ async def handle_upload(
         record_id, normalized_type, cloud_storage_path,
     )
 
-    # Schedule inline processing as a background task (pass file_bytes to avoid extra GCS download)
-    background_tasks.add_task(process_csv_inline, record_id, file_bytes)
-    logger.info("Scheduled inline CSV processing for upload ID %s", record_id)
+    claim_status = await operations.try_claim_for_processing(record_id)
+    if claim_status == "success":
+        background_tasks.add_task(process_csv_inline, record_id, file_bytes)
+        logger.info("Scheduled inline CSV processing for upload ID %s", record_id)
 
     return {
         "message": "Successfully uploaded to cloud",
         "id": record_id,
-        "status": "pending",
+        "status": "in_progress" if claim_status == "success" else "pending",
     }
 
 
