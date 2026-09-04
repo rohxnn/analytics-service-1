@@ -156,6 +156,9 @@ async def pii_and_abusive_language_detection_activity(params: Dict[str, Any]) ->
             db_col = map_column_to_db_col(col, sub_type)
             col_res = _get_case_insensitive_key(llm_response_dict, col)
 
+            if col not in column_statements and isinstance(col_res, list) and len(col_res) > 0 and isinstance(col_res[0], dict):
+                col_res = col_res[0]
+
             if col in column_statements:
                 # List-valued column — expect one masked entry per input statement.
                 original_statements = column_statements[col]
