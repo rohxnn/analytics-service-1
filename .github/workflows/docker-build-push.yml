@@ -39,6 +39,13 @@ jobs:
           if [ -z "$NAMESPACE" ]; then
             NAMESPACE="${{ secrets.DOCKERHUB_USERNAME }}"
           fi
+
+          if [ -z "$NAMESPACE" ]; then
+            echo "❌ Error: Neither DOCKER_NAMESPACE env nor secrets.DOCKERHUB_USERNAME is set."
+            echo "Please set DOCKERHUB_USERNAME in GitHub Repository Secrets (Settings -> Secrets -> Actions)."
+            exit 1
+          fi
+
           echo "Target Namespace: $NAMESPACE"
           echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
 
