@@ -10,6 +10,8 @@ on:
 env:
   DOCKER_IMAGE_NAME: elevate-analytics
   DOCKER_REGISTRY: docker.io
+  # Leave empty for personal testing (will automatically use your secrets.DOCKERHUB_USERNAME)
+  # Or set to organization namespace (e.g. 'shikshalokamqa') when pushing to org repository
   DOCKER_NAMESPACE: 
 
 jobs:
@@ -30,6 +32,16 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Determine Docker Namespace
+        id: get-namespace
+        run: |
+          NAMESPACE="${{ env.DOCKER_NAMESPACE }}"
+          if [ -z "$NAMESPACE" ]; then
+            NAMESPACE="${{ secrets.DOCKERHUB_USERNAME }}"
+          fi
+          echo "Target Namespace: $NAMESPACE"
+          echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+
       - name: Get Docker tag version (fail if not provided)
         id: get-version
         run: |
@@ -47,23 +59,24 @@ jobs:
         id: check-version
         run: |
           VERSION=${{ steps.get-version.outputs.version }}
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/namespaces/${{ env.DOCKER_NAMESPACE }}/repositories/${{ env.DOCKER_IMAGE_NAME }}/tags/$VERSION")
+          NAMESPACE=${{ steps.get-namespace.outputs.namespace }}
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/namespaces/${NAMESPACE}/repositories/${{ env.DOCKER_IMAGE_NAME }}/tags/$VERSION")
           if [ "$RESPONSE" -eq 200 ]; then
-            echo "⚠️  Warning: Tag '$VERSION' already exists on Docker Hub. The workflow will continue and overwrite the existing tag."
+            echo "⚠️  Warning: Tag '$VERSION' already exists on Docker Hub under namespace '$NAMESPACE'. Overwriting existing tag."
           else
-            echo "✅ Tag '$VERSION' does not exist — proceeding with build."
+            echo "✅ Tag '$VERSION' does not exist under namespace '$NAMESPACE' — proceeding with build."
           fi
 
       - name: Build and push Docker image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: |
-            docker.io/${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.get-version.outputs.version }}
-            docker.io/${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:latest
+            docker.io/${{ steps.get-namespace.outputs.namespace }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.get-version.outputs.version }}
+            docker.io/${{ steps.get-namespace.outputs.namespace }}/${{ env.DOCKER_IMAGE_NAME }}:latest
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -74,5 +87,5 @@ jobs:
       - name: Print pushed tags
         run: |
           echo "Pushed tags:"
-          echo "docker.io/${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.get-version.outputs.version }}"
-          echo "docker.io/${{ env.DOCKER_NAMESPACE }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
+          echo "docker.io/${{ steps.get-namespace.outputs.namespace }}/${{ env.DOCKER_IMAGE_NAME }}:${{ steps.get-version.outputs.version }}"
+          echo "docker.io/${{ steps.get-namespace.outputs.namespace }}/${{ env.DOCKER_IMAGE_NAME }}:latest"
