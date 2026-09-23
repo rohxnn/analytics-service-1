@@ -17,7 +17,7 @@ scikit-learn
 torch
 sentence-transformers>=3.0.0
 setfit
-huggingface_hub<=0.23.5
+huggingface_hub>=0.24.0
 hdbscan<=0.8.40
 
 # ── File / media processing ───────────────────────────────────────────────────
