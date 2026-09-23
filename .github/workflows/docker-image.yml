@@ -10,7 +10,7 @@ on:
 env:
   DOCKER_IMAGE_NAME: elevate-analytics # Configure your image name here
   DOCKER_REGISTRY: docker.io
-  DOCKER_NAMESPACE: 
+  DOCKER_NAMESPACE: rohxnnnn
 
 jobs:
   docker-image-build-and-push:
